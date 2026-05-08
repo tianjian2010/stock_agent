@@ -1,10 +1,13 @@
 """Vector store service using ChromaDB."""
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from app.config import ENABLE_VECTOR_SEARCH, VECTOR_STORE_PATH
 from services.llm import create_embedding_model
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreService:
@@ -19,14 +22,28 @@ class VectorStoreService:
         self.collection_name = collection_name
         self._client: Any = None
         self._collection: Any = None
+        self._available: bool | None = None
 
     @property
     def enabled(self) -> bool:
-        return ENABLE_VECTOR_SEARCH and create_embedding_model().configured
+        if not ENABLE_VECTOR_SEARCH:
+            return False
+        if not create_embedding_model().configured:
+            return False
+        if self._available is False:
+            return False
+        try:
+            _ = self.client
+        except Exception as exc:
+            self._available = False
+            logger.warning("Vector store unavailable, falling back to lexical retrieval: %s", exc)
+            return False
+        self._available = True
+        return True
 
     @property
     def client(self) -> Any:
-        if not self.enabled:
+        if not ENABLE_VECTOR_SEARCH or not create_embedding_model().configured:
             raise RuntimeError("Vector search is disabled.")
         if self._client is None:
             import chromadb

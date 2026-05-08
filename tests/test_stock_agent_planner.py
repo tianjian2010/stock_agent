@@ -6,6 +6,23 @@ from agents.stock_agent.runtime import build_agent_plan
 
 
 class StockAgentPlannerTests(unittest.TestCase):
+    def test_handle_catalog_query_returns_documents_by_date(self) -> None:
+        agent = StockAgent()
+        plan = build_agent_plan("5/8日的资料有哪一些？")
+        with patch.object(
+            agent.retriever,
+            "list_documents_by_date",
+            return_value=[
+                {"filename": "福瑞医科0508.txt", "published_at": "2026-05-08"},
+                {"filename": "天岳先进0508.txt", "published_at": "2026-05-08"},
+            ],
+        ):
+            answer = agent._handle_catalog_query("5/8日的资料有哪一些？", plan)
+
+        self.assertIn("2026-05-08 的本地投研资料", answer)
+        self.assertIn("福瑞医科0508.txt", answer)
+        self.assertIn("天岳先进0508.txt", answer)
+
     def test_handle_catalog_query_returns_document_count(self) -> None:
         agent = StockAgent()
         plan = build_agent_plan("现在有多少个投研报告")

@@ -108,6 +108,9 @@ STOP_WORDS = {
 FILENAME_PATTERN = re.compile(
     r"([\w\u4e00-\u9fff&-]+\.(?:txt|docx|pdf|xlsx|xls|csv|mp3|wav|m4a|aac|flac|ogg|mp4))"
 )
+QUERY_DATE_PATTERN = re.compile(
+    r"(20\d{2}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日?|\d{1,2}月\d{1,2}日?)"
+)
 STOCK_CODE_PATTERN = re.compile(r"\b\d{6}\b")
 ALLOWED_STAGE_TYPES = {"retrieval", "tool"}
 ALLOWED_WORKERS = {
@@ -658,21 +661,26 @@ def _resolve_tool_worker(tool_name: str) -> str:
 
 
 def _detect_direct_answer_mode(query: str) -> str | None:
+    has_document_term = any(term in query for term in DOCUMENT_TERMS)
+    has_list_term = any(term in query for term in LIST_DOCUMENT_TERMS)
+    has_date = QUERY_DATE_PATTERN.search(query) is not None
+
+    if has_date and has_document_term and (
+        has_list_term or any(term in query for term in ("哪", "哪些", "有", "看看"))
+    ):
+        return "documents_by_date"
+
     if (
         any(term in query for term in LATEST_DOCUMENT_TERMS)
-        and any(term in query for term in DOCUMENT_TERMS)
+        and has_document_term
         and any(term in query for term in ("哪些", "哪几篇", "清单", "列出", "一批"))
     ):
         return "latest_documents"
 
-    if any(term in query for term in COUNT_DOCUMENT_TERMS) and any(
-        term in query for term in DOCUMENT_TERMS
-    ):
+    if any(term in query for term in COUNT_DOCUMENT_TERMS) and has_document_term:
         return "count_documents"
 
-    if any(term in query for term in LIST_DOCUMENT_TERMS) and any(
-        term in query for term in DOCUMENT_TERMS
-    ):
+    if has_list_term and has_document_term:
         return "list_documents"
 
     if FILENAME_PATTERN.search(query):
@@ -777,6 +785,8 @@ def _classify_intent(
     planned_tools: list[PlannedTool],
     use_document_search: bool,
 ) -> str:
+    if direct_answer_mode == "documents_by_date":
+        return "document_catalog_by_date"
     if direct_answer_mode == "latest_documents":
         return "document_catalog_latest"
     if direct_answer_mode == "count_documents":

@@ -14,6 +14,12 @@ from agents.stock_agent.runtime import (
 
 
 class StockAgentRuntimeTests(unittest.TestCase):
+    def test_build_agent_plan_routes_documents_by_date_query(self) -> None:
+        plan = build_agent_plan("5/8日的资料有哪一些？")
+        self.assertEqual(plan.direct_answer_mode, "documents_by_date")
+        self.assertFalse(plan.use_document_search)
+        self.assertEqual(plan.intent, "document_catalog_by_date")
+
     def test_build_agent_plan_routes_latest_document_query(self) -> None:
         plan = build_agent_plan("最近的投研文档有哪些")
         self.assertEqual(plan.direct_answer_mode, "latest_documents")

@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 INDEX_STATE_FILE = "data/cache/.index_state.json"
 
 DATE_PATTERN = re.compile(r"(?P<date>\d{4,8})")
+QUERY_DATE_PATTERNS = (
+    re.compile(r"(?P<year>20\d{2})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})"),
+    re.compile(r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?"),
+    re.compile(r"(?<!\d)(?P<month>\d{1,2})[/-](?P<day>\d{1,2})(?!\d)"),
+    re.compile(r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日?"),
+)
 KEYWORD_PATTERN = re.compile(r"[A-Za-z0-9]{2,}|[\u4e00-\u9fff]{2,}")
 STOP_WORDS = {
     "关于",
@@ -91,6 +97,23 @@ def _normalize_filename_date(raw_date: str) -> tuple[int, int, int]:
     if len(raw_date) == 4:
         return DOCUMENT_DEFAULT_YEAR, int(raw_date[:2]), int(raw_date[2:4])
     raise ValueError(f"Unsupported date pattern: {raw_date}")
+
+
+def parse_query_date(query: str) -> str | None:
+    """Extract a normalized ISO date from a user query if one is present."""
+    for pattern in QUERY_DATE_PATTERNS:
+        match = pattern.search(query)
+        if not match:
+            continue
+        groups = match.groupdict()
+        year = int(groups.get("year") or DOCUMENT_DEFAULT_YEAR)
+        month = int(groups["month"])
+        day = int(groups["day"])
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+    return None
 
 
 def extract_query_keywords(query: str, limit: int = 6) -> list[str]:
@@ -425,6 +448,10 @@ class DocumentRetriever:
         if not latest_date:
             return []
         return [item for item in docs if item.get("published_at") == latest_date]
+
+    def list_documents_by_date(self, published_at: str) -> list[dict[str, Any]]:
+        docs = self.list_documents()
+        return [item for item in docs if item.get("published_at") == published_at]
 
     def get_document(self, filename: str) -> dict[str, Any] | None:
         if not self._indexed:

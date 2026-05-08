@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from services.document_retriever import DocumentRetriever, parse_document_metadata
+from services.document_retriever import DocumentRetriever, parse_document_metadata, parse_query_date
 
 
 class FakeLoader:
@@ -21,6 +21,9 @@ class DocumentRetrieverTests(unittest.TestCase):
         metadata = parse_document_metadata("创新药0415.docx")
         self.assertEqual(metadata["topic"], "创新药")
         self.assertRegex(metadata["published_at"], r"^\d{4}-04-15$")
+
+    def test_parse_query_date_supports_month_day(self) -> None:
+        self.assertRegex(parse_query_date("5/8日的资料有哪一些？") or "", r"^\d{4}-05-08$")
 
     def test_search_returns_relevant_chunk(self) -> None:
         documents = [
@@ -65,6 +68,49 @@ class DocumentRetrieverTests(unittest.TestCase):
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[0].metadata["filename"], "量子0416.txt")
         self.assertIn("量子通信", results[0].content)
+
+    def test_list_documents_by_date_filters_published_at(self) -> None:
+        documents = [
+            {
+                "content": "a",
+                "metadata": {"source": "docs/福瑞医科0508.txt", "filename": "福瑞医科0508.txt"},
+            },
+            {
+                "content": "b",
+                "metadata": {"source": "docs/国芯科技0507.txt", "filename": "国芯科技0507.txt"},
+            },
+        ]
+        chunks_by_source = {
+            str(Path("docs/福瑞医科0508.txt")): [
+                {
+                    "content": "a",
+                    "metadata": {
+                        "source": "docs/福瑞医科0508.txt",
+                        "filename": "福瑞医科0508.txt",
+                        "chunk_id": 0,
+                        "total_chunks": 1,
+                    },
+                }
+            ],
+            str(Path("docs/国芯科技0507.txt")): [
+                {
+                    "content": "b",
+                    "metadata": {
+                        "source": "docs/国芯科技0507.txt",
+                        "filename": "国芯科技0507.txt",
+                        "chunk_id": 0,
+                        "total_chunks": 1,
+                    },
+                }
+            ],
+        }
+
+        retriever = DocumentRetriever(loader=FakeLoader(documents, chunks_by_source))
+        retriever.index_documents(force=True)
+        results = retriever.list_documents_by_date("2026-05-08")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["filename"], "福瑞医科0508.txt")
 
 
 if __name__ == "__main__":

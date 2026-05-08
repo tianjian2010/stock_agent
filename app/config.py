@@ -43,7 +43,7 @@ TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "").strip()
 MINIMAX_GROUP_ID = os.getenv("MINIMAX_GROUP_ID", "").strip()
 MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2.7").strip()
-MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1").strip()
+MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.io/v1").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o").strip()

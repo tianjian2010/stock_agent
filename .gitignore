@@ -1,1 +1,9 @@
 .env
+__pycache__/
+*.pyc
+*.pyo
+*.bin
+*.sqlite3
+*.db
+.claude/settings.local.json
+data/cache/

@@ -31,6 +31,14 @@ def _require_api_key() -> str:
     return MINIMAX_API_KEY
 
 
+def _normalize_minimax_base_url(base_url: str) -> str:
+    normalized = (base_url or "").strip()
+    if not normalized:
+        return "https://api.minimax.io/v1"
+    # Older configs mistakenly used minimaxi.com; normalize to the official endpoint.
+    return normalized.replace("api.minimaxi.com", "api.minimax.io")
+
+
 @dataclass(slots=True)
 class ChatResult:
     content: str
@@ -55,8 +63,12 @@ class OpenAICompatibleChatModel:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.thinking_enabled = thinking_enabled
-        self.client = OpenAI(api_key=_require_api_key(), base_url=MINIMAX_BASE_URL)
-        self.async_client = AsyncOpenAI(api_key=_require_api_key(), base_url=MINIMAX_BASE_URL)
+        client_kwargs = {
+            "api_key": _require_api_key(),
+            "base_url": _normalize_minimax_base_url(MINIMAX_BASE_URL),
+        }
+        self.client = OpenAI(**client_kwargs)
+        self.async_client = AsyncOpenAI(**client_kwargs)
 
     def invoke(self, messages: list[Any]) -> ChatResult:
         try:
@@ -397,7 +409,7 @@ def create_embedding_model() -> OpenAICompatibleEmbeddings:
 
     if provider == "minimax":
         api_key = api_key or MINIMAX_API_KEY
-        base_url = base_url or MINIMAX_BASE_URL
+        base_url = _normalize_minimax_base_url(base_url or MINIMAX_BASE_URL)
     elif provider == "openai":
         api_key = api_key or OPENAI_API_KEY
     elif provider == "ollama":

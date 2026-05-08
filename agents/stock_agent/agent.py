@@ -31,7 +31,12 @@ from agents.stock_agent.runtime import (
 from agents.stock_agent.subagents import SubAgentInput, SubAgentOutput, SubAgentRegistry
 from app.config import ENABLE_LLM_PLANNER, PLAN_REUSE_MAX_AGE_HOURS, PLAN_REUSE_MIN_SCORE
 from services.db import get_chat_db
-from services.document_retriever import RetrievalResult, extract_query_keywords, get_document_retriever
+from services.document_retriever import (
+    RetrievalResult,
+    extract_query_keywords,
+    get_document_retriever,
+    parse_query_date,
+)
 from services.llm import create_stock_chat
 from services.memory import ConversationMemoryService
 
@@ -183,7 +188,7 @@ class StockAgent:
                 )
             )
 
-        self.retriever.index_documents()
+        self.retriever.index_documents_incremental()
 
         direct_answer = self._handle_catalog_query(query, plan)
         if direct_answer is not None:
@@ -380,7 +385,7 @@ class StockAgent:
                 )
             )
 
-        self.retriever.index_documents()
+        self.retriever.index_documents_incremental()
         if progress_callback is not None:
             progress_callback("documents_indexed", {"vector_search_ready": True})
 
@@ -752,6 +757,18 @@ class StockAgent:
             return parsed
 
     def _handle_catalog_query(self, query: str, plan: AgentPlan) -> str | None:
+        if plan.direct_answer_mode == "documents_by_date":
+            published_at = parse_query_date(query)
+            if not published_at:
+                return "未能识别你提到的日期，请换成如 5/8、05/08 或 2026-05-08。"
+            docs = self.retriever.list_documents_by_date(published_at)
+            if not docs:
+                return f"没有找到日期为 {published_at} 的本地投研资料。"
+            lines = [f"{published_at} 的本地投研资料（共 {len(docs)} 篇）："]
+            for item in docs:
+                lines.append(f"- {item['filename']} ({item.get('published_at') or '未知日期'})")
+            return "\n".join(lines)
+
         if plan.direct_answer_mode == "count_documents":
             docs = self.retriever.list_documents()
             return f"当前本地共有 {len(docs)} 份投研报告。"

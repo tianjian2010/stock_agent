@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from services.llm import OpenAICompatibleEmbeddings
+from services.llm import OpenAICompatibleEmbeddings, _normalize_minimax_base_url
 from services.vector_store import VectorStoreService
 
 
@@ -20,6 +20,12 @@ class _FakeEmbeddingsAPI:
 
 
 class OpenAICompatibleEmbeddingsTests(unittest.TestCase):
+    def test_normalize_minimax_base_url_rewrites_legacy_domain(self) -> None:
+        self.assertEqual(
+            _normalize_minimax_base_url("https://api.minimaxi.com/v1"),
+            "https://api.minimax.io/v1",
+        )
+
     def test_minimax_native_payload_uses_texts_and_query_type(self) -> None:
         model = OpenAICompatibleEmbeddings(
             model="MiniMax-embedding-01",
@@ -115,15 +121,33 @@ class OpenAICompatibleEmbeddingsTests(unittest.TestCase):
 
 
 class VectorStoreServiceTests(unittest.TestCase):
-    def test_enabled_follows_embedding_configuration(self) -> None:
+    def test_enabled_returns_true_when_embedding_is_configured_and_client_is_available(self) -> None:
         service = VectorStoreService()
 
         with patch("services.vector_store.create_embedding_model") as create_model:
             create_model.return_value = SimpleNamespace(configured=True)
-            self.assertTrue(service.enabled)
+            with patch.object(VectorStoreService, "client", new=property(lambda _self: object())):
+                self.assertTrue(service.enabled)
 
+    def test_enabled_returns_false_when_embedding_is_not_configured(self) -> None:
+        service = VectorStoreService()
+
+        with patch("services.vector_store.create_embedding_model") as create_model:
             create_model.return_value = SimpleNamespace(configured=False)
             self.assertFalse(service.enabled)
+
+    def test_enabled_falls_back_when_client_init_fails(self) -> None:
+        service = VectorStoreService()
+
+        with patch("services.vector_store.create_embedding_model") as create_model:
+            create_model.return_value = SimpleNamespace(configured=True)
+            with patch.object(
+                VectorStoreService,
+                "client",
+                new=property(lambda _self: (_ for _ in ()).throw(PermissionError("denied"))),
+            ):
+                self.assertFalse(service.enabled)
+                self.assertFalse(service.enabled)
 
 
 if __name__ == "__main__":
