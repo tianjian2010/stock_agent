@@ -1,0 +1,137 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f4efe6;
+  --bg-2: #e9e1d3;
+  --surface: rgba(255, 253, 248, 0.86);
+  --surface-solid: #fffdf8;
+  --surface-strong: #f6f0e5;
+  --border: rgba(71, 63, 48, 0.12);
+  --border-strong: rgba(71, 63, 48, 0.2);
+  --text: #16130f;
+  --muted: #6f675b;
+  --accent: #7c5c3a;
+  --accent-2: #38576a;
+  --accent-soft: #b68a5c;
+  --shadow: 0 24px 60px rgba(60, 46, 26, 0.12);
+  --shadow-soft: 0 10px 30px rgba(60, 46, 26, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.82), transparent 34%),
+    radial-gradient(circle at 82% 12%, rgba(56, 87, 106, 0.1), transparent 26%),
+    radial-gradient(circle at 20% 85%, rgba(124, 92, 58, 0.08), transparent 24%),
+    linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+  font-family:
+    "Iowan Old Style",
+    "Palatino Linotype",
+    "Georgia",
+    "Times New Roman",
+    serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 32px 32px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.45), transparent 90%);
+  opacity: 0.25;
+}
+
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(255, 255, 255, 0.2), transparent 36%),
+    linear-gradient(180deg, transparent 0%, rgba(25, 18, 12, 0.02) 100%);
+  mix-blend-mode: soft-light;
+}
+
+::selection {
+  background: rgba(124, 92, 58, 0.18);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background: rgba(71, 63, 48, 0.18);
+  background-clip: content-box;
+}
+
+a {
+  color: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.prose {
+  color: var(--text);
+}
+
+.prose p {
+  margin: 0 0 0.75rem;
+}
+
+.prose ul,
+.prose ol {
+  margin: 0.75rem 0;
+  padding-left: 1.25rem;
+}
+
+.prose li {
+  margin: 0.25rem 0;
+}
+
+.prose code {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.7);
+  border-radius: 0.45rem;
+  padding: 0.15rem 0.35rem;
+}
+
+.prose pre {
+  margin: 0.75rem 0;
+  padding: 1rem;
+  background: #12100d;
+  color: #f4efe6;
+  border-radius: 1rem;
+  overflow-x: auto;
+}
+
+.prose pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+}

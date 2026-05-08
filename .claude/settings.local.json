@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from app.web.chat_page import main; print\\('Chat page OK'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -m py_compile app/config.py services/*.py skills/*/*.py skills/*/skill.py middleware/*.py app/web/*.py agents/stock_agent/agent.py app/main.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/package_skill.py --help)",
+      "Bash(python -c \"from app.api.main import app; print\\('API imports OK'\\)\")",
+      "Bash(python -c \"from app.api.main import app; print\\('main.py OK'\\)\")",
+      "Bash(npm run *)",
+      "Bash(python -m py_compile app/api/main.py app/api/admin.py app/life.py services/document_retriever.py)",
+      "Bash(python skills/gitman/scripts/gitman.py --help)",
+      "Bash(python skills/gitman/scripts/gitman.py status)",
+      "Bash(python skills/gitman/scripts/gitman.py add *)",
+      "Bash(python skills/gitman/scripts/gitman.py commit *)",
+      "Bash(python skills/gitman/scripts/gitman.py push *)",
+      "Bash(python skills/gitman/scripts/gitman.py pull)",
+      "Bash(python skills/gitman/scripts/gitman.py log *)",
+      "Bash(python skills/gitman/scripts/gitman.py branch)",
+      "Bash(python skills/gitman/scripts/gitman.py checkout *)",
+      "Bash(python skills/gitman/scripts/gitman.py diff)",
+      "Bash(python skills/gitman/scripts/gitman.py init *)",
+      "Bash(python skills/gitman/scripts/gitman.py push --force --dangerous-confirm)",
+      "Bash(python skills/gitman/scripts/gitman.py reset --hard --dangerous-confirm)",
+      "Bash(python skills/gitman/scripts/gitman.py checkout -f *)"
+    ]
+  },
+  "hooks": {
+    "UserPromptExpansion": [
+      {
+        "match": "^/gitman",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "使用 GitMan skill 执行 Git 操作。命令格式: /gitman <command> [options]\n\n支持的命令:\n- status: 查看状态\n- add <files>: 暂存文件\n- commit -m <msg>: 提交\n- push [--force]: 推送\n- pull: 拉取\n- log [-n count]: 查看历史\n- branch: 查看分支\n- checkout <branch>: 切换分支\n\n自然语言支持: '提交代码'、'推送代码' 等\n\n危险操作 (push --force, reset --hard) 需要 --dangerous-confirm 参数"
+          }
+        ]
+      }
+    ]
+  }
+}
