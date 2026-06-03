@@ -16,11 +16,23 @@ export function CitationPanel({ citations }: CitationPanelProps) {
       </h3>
       <ul className="space-y-2 px-4 pb-4">
         {citations.map((citation, idx) => (
-          <li key={`${citation.filename}-${idx}`} className="flex items-start gap-2 text-sm">
+          <li
+            id={`citation-${idx + 1}`}
+            key={`${citation.filename}-${idx}`}
+            className="scroll-mt-24 rounded-2xl border border-[var(--border)] bg-white/75 p-3 text-sm shadow-[var(--shadow-soft)]"
+          >
+            <div className="flex items-start gap-2">
             <FileText size={14} className="mt-0.5 shrink-0 text-[var(--accent-2)]" />
             <div>
-              <p className="text-[var(--text)]">{citation.filename}</p>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-[var(--muted)]">
+                  [资料{idx + 1}]
+                </p>
+                <p className="text-[var(--text)]">{citation.filename}</p>
               {citation.published_at && <p className="text-xs text-[var(--muted)]">{citation.published_at}</p>}
+                {citation.snippet && (
+                  <p className="mt-2 line-clamp-4 text-xs leading-5 text-[#5f574c]">{citation.snippet}</p>
+                )}
+              </div>
             </div>
           </li>
         ))}

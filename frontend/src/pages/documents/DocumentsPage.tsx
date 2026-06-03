@@ -61,7 +61,7 @@ export default function DocumentsPage() {
             <div>
               <h1 className="text-2xl font-semibold text-[var(--text)]">资料管理</h1>
               <p className="mt-1 max-w-2xl text-sm text-[var(--muted)]">
-                上传到 `stock_docs` 的新文件会立即执行增量入库，系统启动时也会自动补齐未完成矢量化的资料。
+                上传会先执行文件名预处理（规范日期/版本、重复内容检测），再写入 `stock_docs` 并增量入库。
               </p>
             </div>
             <button
@@ -91,7 +91,7 @@ export default function DocumentsPage() {
                 <Upload size={22} className="mb-3 text-[var(--accent-2)]" />
                 <span className="text-sm font-medium text-[var(--text)]">选择一个或多个新增文件</span>
                 <span className="mt-1 text-xs text-[var(--muted)]">
-                  上传后会复制到本地资料目录，并立即执行增量矢量化。
+                  先预处理，再写入资料目录，最后立即执行增量矢量化。
                 </span>
                 <input
                   type="file"
@@ -188,7 +188,7 @@ export default function DocumentsPage() {
                 </div>
                 <div className="mt-4 space-y-3 text-sm text-[var(--muted)]">
                   <p>1. 服务启动时会扫描 `stock_docs`，把未矢量化、已修改或缺失的文件补入向量库。</p>
-                  <p>2. 通过这里上传的新文件会先落盘，再立即执行增量入库。</p>
+                  <p>2. 通过这里上传的新文件会先做预处理（命名标准化、版本分配、重复检测），再落盘入库。</p>
                   <p>3. 后台定时任务仍会继续巡检，避免漏掉手工拷贝进目录的新文件。</p>
                 </div>
               </div>

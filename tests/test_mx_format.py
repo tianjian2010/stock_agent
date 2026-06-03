@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from skills.mx_data import MXDataSkill, MXSearchSkill, MXSelectStockSkill
 
@@ -63,6 +64,18 @@ class MXFormattingTests(unittest.TestCase):
         )
         self.assertIn("688256", output)
         self.assertIn("寒武纪", output)
+
+    def test_query_kline_posts_to_kline_url(self) -> None:
+        skill = MXDataSkill()
+        fake_response = {"data": {"data": {"klines": []}}}
+        with patch.object(skill, "_post", return_value=fake_response) as mocked:
+            result = skill.query_kline("603019", period="day", count=60)
+        self.assertEqual(result, fake_response)
+        args, _kwargs = mocked.call_args
+        self.assertTrue(str(args[0]).startswith("http"))
+        self.assertEqual(args[1]["stockCode"], "603019")
+        self.assertEqual(args[1]["period"], "day")
+        self.assertEqual(args[1]["count"], 60)
 
 
 if __name__ == "__main__":

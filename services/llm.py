@@ -1,11 +1,12 @@
 """MiniMax-compatible LLM service wrappers built on the OpenAI client."""
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import requests
-from openai import AsyncOpenAI, OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, OpenAI
 
 from app.config import (
     EMBEDDING_API_KEY,
@@ -13,6 +14,7 @@ from app.config import (
     EMBEDDING_PROVIDER,
     EMBEDDING_DIMENSION,
     EMBEDDING_MODEL,
+    LLM_STARTUP_HEALTHCHECK_TIMEOUT_SECONDS,
     MINIMAX_API_KEY,
     MINIMAX_BASE_URL,
     MINIMAX_MODEL,
@@ -34,14 +36,130 @@ def _require_api_key() -> str:
 def _normalize_minimax_base_url(base_url: str) -> str:
     normalized = (base_url or "").strip()
     if not normalized:
-        return "https://api.minimax.io/v1"
-    # Older configs mistakenly used minimaxi.com; normalize to the official endpoint.
-    return normalized.replace("api.minimaxi.com", "api.minimax.io")
+        return "https://api.minimaxi.com/v1"
+    return normalized.rstrip("/")
 
 
 @dataclass(slots=True)
 class ChatResult:
     content: str
+
+
+def _mask_api_key(api_key: str) -> str:
+    value = (api_key or "").strip()
+    if not value:
+        return "missing"
+    if len(value) <= 10:
+        return "set"
+    return f"{value[:4]}...{value[-2:]}"
+
+
+def _extract_status_code(exc: Exception) -> Any:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        return status_code
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", "unknown")
+
+
+def _extract_error_text(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if body:
+        return str(body)
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        text = getattr(response, "text", None)
+        if text:
+            return str(text)
+        try:
+            json_body = response.json()
+        except Exception:
+            json_body = None
+        if json_body:
+            return str(json_body)
+    return str(exc)
+
+
+def _classify_llm_exception(exc: Exception) -> str:
+    if isinstance(exc, APITimeoutError):
+        return "timeout"
+    if isinstance(exc, APIConnectionError):
+        return "connection_error"
+    if isinstance(exc, APIStatusError):
+        if getattr(exc, "status_code", None) == 401:
+            return "invalid_api_key"
+        if getattr(exc, "status_code", None) == 404:
+            return "bad_base_url"
+
+    lower_message = str(exc).lower()
+    if "invalid api key" in lower_message or "authorized_error" in lower_message or "401" in lower_message:
+        return "invalid_api_key"
+    if "connection error" in lower_message:
+        return "connection_error"
+    if "timeout" in lower_message:
+        return "timeout"
+    if "404" in lower_message or "not found" in lower_message:
+        return "bad_base_url"
+    return type(exc).__name__
+
+
+def _llm_error_details(exc: Exception) -> dict[str, Any]:
+    return {
+        "category": _classify_llm_exception(exc),
+        "error_type": type(exc).__name__,
+        "status_code": _extract_status_code(exc),
+        "detail": _extract_error_text(exc),
+    }
+
+
+def describe_minimax_chat_config() -> dict[str, Any]:
+    normalized_base_url = _normalize_minimax_base_url(MINIMAX_BASE_URL)
+    return {
+        "provider": "minimax",
+        "model": MINIMAX_MODEL,
+        "base_url": normalized_base_url,
+        "base_url_source": MINIMAX_BASE_URL or "",
+        "api_key_present": bool(MINIMAX_API_KEY),
+        "api_key_preview": _mask_api_key(MINIMAX_API_KEY),
+    }
+
+
+def diagnose_minimax_auth() -> dict[str, Any]:
+    config = describe_minimax_chat_config()
+    result: dict[str, Any] = {
+        **config,
+        "ok": False,
+        "category": "unknown",
+        "message": "",
+    }
+
+    if not MINIMAX_API_KEY:
+        result["category"] = "missing_api_key"
+        result["message"] = "MINIMAX_API_KEY is missing."
+        return result
+
+    try:
+        client = OpenAI(api_key=MINIMAX_API_KEY, base_url=config["base_url"])
+        client.chat.completions.create(
+            model=MINIMAX_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=8,
+            temperature=0,
+            extra_body={},
+            timeout=LLM_STARTUP_HEALTHCHECK_TIMEOUT_SECONDS,
+        )
+        result["ok"] = True
+        result["category"] = "ok"
+        result["message"] = "MiniMax chat authentication check passed."
+        return result
+    except Exception as exc:
+        details = _llm_error_details(exc)
+        result["message"] = details["detail"]
+        result["category"] = details["category"]
+        result["error_type"] = details["error_type"]
+        result["status_code"] = details["status_code"]
+        return result
 
 
 class OpenAICompatibleChatModel:
@@ -63,26 +181,43 @@ class OpenAICompatibleChatModel:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.thinking_enabled = thinking_enabled
-        client_kwargs = {
-            "api_key": _require_api_key(),
-            "base_url": _normalize_minimax_base_url(MINIMAX_BASE_URL),
-        }
-        self.client = OpenAI(**client_kwargs)
-        self.async_client = AsyncOpenAI(**client_kwargs)
+        self.base_url = _normalize_minimax_base_url(MINIMAX_BASE_URL)
+        self.client = OpenAI(
+            api_key=_require_api_key(),
+            base_url=self.base_url,
+        )
+        self.async_client = AsyncOpenAI(
+            api_key=_require_api_key(),
+            base_url=self.base_url,
+        )
 
     def invoke(self, messages: list[Any]) -> ChatResult:
+        normalized_messages = self._normalize_messages(messages)
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self._normalize_messages(messages),
+                messages=normalized_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 extra_body=self._build_extra_body(),
             )
         except Exception as exc:
+            details = _llm_error_details(exc)
             logger.error(
-                "LLM invoke failed: model=%s, temperature=%s, max_tokens=%s, thinking=%s, error=%s",
-                self.model, self.temperature, self.max_tokens, self.thinking_enabled, exc,
+                "LLM invoke failed: category=%s, error_type=%s, status=%s, model=%s, base_url=%s, "
+                "temperature=%s, max_tokens=%s, thinking_requested=%s, thinking_global=%s, "
+                "message_count=%s, error=%s",
+                details["category"],
+                details["error_type"],
+                details["status_code"],
+                self.model,
+                self.base_url,
+                self.temperature,
+                self.max_tokens,
+                self.thinking_enabled,
+                THINKING_ENABLED,
+                len(normalized_messages),
+                details["detail"],
             )
             raise
         if not response.choices:
@@ -94,18 +229,32 @@ class OpenAICompatibleChatModel:
         return ChatResult(content=response.choices[0].message.content or "")
 
     async def ainvoke(self, messages: list[Any]) -> ChatResult:
+        normalized_messages = self._normalize_messages(messages)
         try:
             response = await self.async_client.chat.completions.create(
                 model=self.model,
-                messages=self._normalize_messages(messages),
+                messages=normalized_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 extra_body=self._build_extra_body(),
             )
         except Exception as exc:
+            details = _llm_error_details(exc)
             logger.error(
-                "LLM ainvoke failed: model=%s, temperature=%s, max_tokens=%s, thinking=%s, error=%s",
-                self.model, self.temperature, self.max_tokens, self.thinking_enabled, exc,
+                "LLM ainvoke failed: category=%s, error_type=%s, status=%s, model=%s, base_url=%s, "
+                "temperature=%s, max_tokens=%s, thinking_requested=%s, thinking_global=%s, "
+                "message_count=%s, error=%s",
+                details["category"],
+                details["error_type"],
+                details["status_code"],
+                self.model,
+                self.base_url,
+                self.temperature,
+                self.max_tokens,
+                self.thinking_enabled,
+                THINKING_ENABLED,
+                len(normalized_messages),
+                details["detail"],
             )
             raise
         if not response.choices:
@@ -118,28 +267,43 @@ class OpenAICompatibleChatModel:
 
     def stream(self, messages: list[Any]) -> Any:
         """Streaming chat completion yielding deltas."""
+        normalized_messages = self._normalize_messages(messages)
         try:
             return self.client.chat.completions.create(
                 model=self.model,
-                messages=self._normalize_messages(messages),
+                messages=normalized_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 extra_body=self._build_extra_body(),
                 stream=True,
             )
         except Exception as exc:
+            details = _llm_error_details(exc)
             logger.error(
-                "LLM stream failed: model=%s, temperature=%s, max_tokens=%s, thinking=%s, error=%s",
-                self.model, self.temperature, self.max_tokens, self.thinking_enabled, exc,
+                "LLM stream failed: category=%s, error_type=%s, status=%s, model=%s, base_url=%s, "
+                "temperature=%s, max_tokens=%s, thinking_requested=%s, thinking_global=%s, "
+                "message_count=%s, error=%s",
+                details["category"],
+                details["error_type"],
+                details["status_code"],
+                self.model,
+                self.base_url,
+                self.temperature,
+                self.max_tokens,
+                self.thinking_enabled,
+                THINKING_ENABLED,
+                len(normalized_messages),
+                details["detail"],
             )
             raise
 
     async def astream(self, messages: list[Any]) -> Any:
         """Async streaming chat completion yielding deltas."""
+        normalized_messages = self._normalize_messages(messages)
         try:
             async for chunk in await self.async_client.chat.completions.create(
                 model=self.model,
-                messages=self._normalize_messages(messages),
+                messages=normalized_messages,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
                 extra_body=self._build_extra_body(),
@@ -147,9 +311,22 @@ class OpenAICompatibleChatModel:
             ):
                 yield chunk
         except Exception as exc:
+            details = _llm_error_details(exc)
             logger.error(
-                "LLM astream failed: model=%s, temperature=%s, max_tokens=%s, thinking=%s, error=%s",
-                self.model, self.temperature, self.max_tokens, self.thinking_enabled, exc,
+                "LLM astream failed: category=%s, error_type=%s, status=%s, model=%s, base_url=%s, "
+                "temperature=%s, max_tokens=%s, thinking_requested=%s, thinking_global=%s, "
+                "message_count=%s, error=%s",
+                details["category"],
+                details["error_type"],
+                details["status_code"],
+                self.model,
+                self.base_url,
+                self.temperature,
+                self.max_tokens,
+                self.thinking_enabled,
+                THINKING_ENABLED,
+                len(normalized_messages),
+                details["detail"],
             )
             raise
 
@@ -312,7 +489,7 @@ class OpenAICompatibleEmbeddings:
         except Exception as exc:
             raise RuntimeError(
                 "MiniMax embedding request failed "
-                f"({self.describe()}, status={self._extract_status_code(exc)}, error={self._extract_error_text(exc)})"
+                f"({self.describe()}, status={_extract_status_code(exc)}, error={_extract_error_text(exc)})"
             ) from exc
 
         try:
@@ -350,7 +527,7 @@ class OpenAICompatibleEmbeddings:
         except Exception as exc:
             raise RuntimeError(
                 "Embedding request failed "
-                f"({self.describe()}, status={self._extract_status_code(exc)}, error={self._extract_error_text(exc)})"
+                f"({self.describe()}, status={_extract_status_code(exc)}, error={_extract_error_text(exc)})"
             ) from exc
 
         data = getattr(response, "data", None) or []
@@ -364,33 +541,6 @@ class OpenAICompatibleEmbeddings:
                 raise RuntimeError(f"Embedding item missing vector payload ({self.describe()})")
             embeddings.append(embedding)
         return embeddings
-
-    @staticmethod
-    def _extract_status_code(exc: Exception) -> Any:
-        status_code = getattr(exc, "status_code", None)
-        if status_code is not None:
-            return status_code
-        response = getattr(exc, "response", None)
-        return getattr(response, "status_code", "unknown")
-
-    @staticmethod
-    def _extract_error_text(exc: Exception) -> str:
-        body = getattr(exc, "body", None)
-        if body:
-            return str(body)
-
-        response = getattr(exc, "response", None)
-        if response is not None:
-            text = getattr(response, "text", None)
-            if text:
-                return str(text)
-            try:
-                json_body = response.json()
-            except Exception:
-                json_body = None
-            if json_body:
-                return str(json_body)
-        return str(exc)
 
     @staticmethod
     def _should_retry_without_dimensions(exc: Exception) -> bool:
@@ -451,3 +601,163 @@ def create_stock_chat(
         max_tokens=max_tokens,
         thinking_enabled=thinking_enabled,
     )
+
+
+# ----------------------------------------------------------------------
+# Token counting utilities for context window budget control
+# ----------------------------------------------------------------------
+# MiniMax-M2.7 context window: 204,800 tokens (input side).
+# Conservative default budget: 100 000 tokens for the input context
+# (leaving ~100 000 for the model to generate a response).
+_TOKENS_PER_MESSAGE_OVERHEAD = 4  # role + formatting tags per message
+
+
+def estimate_tokens_for_text(text: str) -> int:
+    """
+    Rough token estimate for a piece of text.
+
+    Based on the fact that:
+      - Chinese characters average ~1.5 tokens each.
+      - English words average ~1.3 tokens each.
+      - Digits and punctuation add ~0.4 tokens per character.
+    """
+    if not text:
+        return 0
+    chinese_chars = sum(1 for ch in text if "一" <= ch <= "鿿")
+    # Count English word-like tokens (alphabetic sequences).
+    english_words = len(_ENGLISH_WORD_RE.findall(text))
+    other_chars = len(text) - chinese_chars - sum(len(w) for w in _ENGLISH_WORD_RE.findall(text))
+    return int(chinese_chars * 1.5) + int(english_words * 1.3) + int(other_chars * 0.4)
+
+
+_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+")
+
+
+def count_messages_tokens(messages: list[dict[str, str]]) -> int:
+    """Return approximate total token count for a list of messages."""
+    total = 0
+    for msg in messages:
+        total += _TOKENS_PER_MESSAGE_OVERHEAD
+        total += estimate_tokens_for_text(msg.get("content", ""))
+    return total
+
+
+def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
+    """Truncate a single text block to fit within max_tokens."""
+    if max_tokens <= 0:
+        return ""
+    tokens = estimate_tokens_for_text(text)
+    if tokens <= max_tokens:
+        return text
+    # Binary-search for the right length (max 8 iterations).
+    low, high = 0, len(text)
+    for _ in range(8):
+        mid = (low + high) // 2
+        if estimate_tokens_for_text(text[:mid]) <= max_tokens:
+            low = mid
+        else:
+            high = mid
+        if high - low <= 1:
+            break
+    return text[:low]
+
+
+# Priority order for truncation (low → high, lowest gets cut first).
+# memory_system = messages whose content starts with "当前会话长期记忆摘要" or
+#                 "最近一次执行摘要"
+_MEMORY_SUMMARY_LABELS = ("当前会话长期记忆摘要", "最近一次执行摘要")
+
+
+def _is_low_priority_memory(msg: dict[str, str]) -> bool:
+    content = msg.get("content", "")
+    role = msg.get("role", "")
+    if role != "system":
+        return False
+    return content.startswith(_MEMORY_SUMMARY_LABELS)
+
+
+def truncate_messages_by_budget(
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    *,
+    always_keep_roles: tuple[str, ...] = ("system", "user"),
+    always_keep_content_starts: tuple[str, ...] = (),
+    doc_context_max_tokens: int | None = None,
+) -> list[dict[str, str]]:
+    """
+    Truncate a message list to fit within max_tokens.
+
+    Truncation strategy (first → last to be cut):
+      1. Low-priority system memory messages (summary, execution snapshot).
+      2. doc_context (when doc_context_max_tokens is set).
+      3. Older user/assistant conversation messages (earliest first).
+
+    Messages that match *always_keep_content_starts* or have roles in
+    *always_keep_roles* are never removed.
+    """
+    if count_messages_tokens(messages) <= max_tokens:
+        return list(messages)
+
+    result: list[dict[str, str]] = []
+    kept_idx: list[int] = []
+
+    # Pass 1: always-keep items
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        starts_keep = any(content.startswith(p) for p in always_keep_content_starts)
+        if role in always_keep_roles or starts_keep:
+            result.append(msg)
+            kept_idx.append(i)
+
+    kept_tokens = count_messages_tokens(result)
+    remaining_budget = max_tokens - kept_tokens
+    if remaining_budget <= 0:
+        return result
+
+    # Pass 2: low-priority memory first (drop oldest of these first)
+    low_priority = [
+        (i, msg) for i, msg in enumerate(messages)
+        if i not in kept_idx and _is_low_priority_memory(msg)
+    ]
+    for i, msg in low_priority:
+        if remaining_budget <= 0:
+            break
+        msg_tokens = count_messages_tokens([msg])
+        if msg_tokens <= remaining_budget:
+            result.append(msg)
+            kept_idx.append(i)
+            remaining_budget -= msg_tokens
+
+    # Pass 3: doc_context truncation
+    if doc_context_max_tokens is not None and doc_context_max_tokens > 0:
+        for i, msg in enumerate(messages):
+            if i in kept_idx:
+                continue
+            content = msg.get("content", "")
+            role = msg.get("role", "")
+            # doc_context messages have role=system and their content starts
+            # with the doc context label.
+            if role == "system" and content.startswith("本地投研资料摘录"):
+                truncated = truncate_text_to_tokens(content, doc_context_max_tokens)
+                result.append({"role": role, "content": truncated})
+                kept_idx.append(i)
+                remaining_budget -= count_messages_tokens([{"role": role, "content": truncated}])
+                break
+
+    if remaining_budget <= 0:
+        return result
+
+    # Pass 4: remaining non-kept messages, oldest first
+    remaining = [(i, msg) for i, msg in enumerate(messages) if i not in kept_idx]
+    for _, msg in remaining:
+        if remaining_budget <= 0:
+            break
+        msg_tokens = count_messages_tokens([msg])
+        if msg_tokens <= remaining_budget:
+            result.append(msg)
+            remaining_budget -= msg_tokens
+
+    # Re-order to original sequence
+    result.sort(key=lambda m: messages.index(m) if m in messages else 999)
+    return result

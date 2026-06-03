@@ -4,6 +4,9 @@ export interface Citation {
   filename: string;
   published_at?: string | null;
   snippet?: string | null;
+  topic?: string | null;
+  chunk_id?: number | null;
+  total_chunks?: number | null;
 }
 
 export interface ToolResult {

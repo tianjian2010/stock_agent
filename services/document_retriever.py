@@ -1,4 +1,4 @@
-"""Document indexing and retrieval services for stock research materials."""
+﻿"""Document indexing and retrieval services for stock research materials."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from app.config import (
     DOCUMENT_DEFAULT_YEAR,
     MAX_DOCUMENT_PREVIEW_CHARS,
     MAX_RETRIEVAL_RESULTS,
+    MAX_RETRIEVAL_RESULTS_WINDOW,
 )
 from services.doc_loader import DocumentLoader
 from services.vector_store import get_vector_store
@@ -24,12 +25,22 @@ logger = logging.getLogger(__name__)
 
 INDEX_STATE_FILE = "data/cache/.index_state.json"
 
-DATE_PATTERN = re.compile(r"(?P<date>\d{4,8})")
+DATE_PATTERNS = (
+    re.compile(r"(?P<date>20\d{2}[-_/\.]\d{1,2}[-_/\.]\d{1,2})"),
+    re.compile(r"(?<!\d)(?P<date>20\d{2}[01]\d[0-3]\d)(?!\d)"),
+    re.compile(r"(?<!\d)(?P<date>\d{6})(?!\d)"),
+    re.compile(r"(?<!\d)(?P<date>\d{4})(?!\d)"),
+)
 QUERY_DATE_PATTERNS = (
     re.compile(r"(?P<year>20\d{2})[/-](?P<month>\d{1,2})[/-](?P<day>\d{1,2})"),
     re.compile(r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日?"),
     re.compile(r"(?<!\d)(?P<month>\d{1,2})[/-](?P<day>\d{1,2})(?!\d)"),
     re.compile(r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日?"),
+)
+RELATIVE_DATE_OFFSETS = (
+    (("\u4eca\u5929", "\u4eca\u65e5", "\u5f53\u5929"), 0),
+    (("\u6628\u5929", "\u6628\u65e5"), -1),
+    (("\u660e\u5929", "\u660e\u65e5"), 1),
 )
 KEYWORD_PATTERN = re.compile(r"[A-Za-z0-9]{2,}|[\u4e00-\u9fff]{2,}")
 STOP_WORDS = {
@@ -71,15 +82,18 @@ def parse_document_metadata(filename: str) -> dict[str, Any]:
     topic = stem
     published_at = ""
 
-    match = DATE_PATTERN.search(stem)
-    if match:
-        topic = stem[: match.start()].rstrip("-_ ")
-        raw_date = match.group("date")
-        year, month, day = _normalize_filename_date(raw_date)
+    for pattern in DATE_PATTERNS:
+        match = pattern.search(stem)
+        if not match:
+            continue
+        raw_date = match.group("date").replace("-", "").replace("_", "").replace(".", "").replace("/", "")
         try:
+            year, month, day = _normalize_filename_date(raw_date)
             published_at = date(year, month, day).isoformat()
+            topic = stem[: match.start()].rstrip("-_ ")
+            break
         except ValueError:
-            published_at = ""
+            continue
 
     return {
         "filename": filename,
@@ -95,14 +109,31 @@ def _normalize_filename_date(raw_date: str) -> tuple[int, int, int]:
     if len(raw_date) == 6:
         return 2000 + int(raw_date[:2]), int(raw_date[2:4]), int(raw_date[4:6])
     if len(raw_date) == 4:
-        return DOCUMENT_DEFAULT_YEAR, int(raw_date[:2]), int(raw_date[2:4])
+        year = DOCUMENT_DEFAULT_YEAR
+        month = int(raw_date[:2])
+        day = int(raw_date[2:4])
+        # If MMDD is invalid (e.g. 1301), keep tuple and let caller treat as invalid date.
+        # This avoids crashing the indexing loop on malformed filenames.
+        try:
+            inferred = date(year, month, day)
+        except ValueError:
+            return year, month, day
+        # If the inferred date is in the future, the document is from last year
+        if inferred > date.today():
+            year -= 1
+        return year, month, day
     raise ValueError(f"Unsupported date pattern: {raw_date}")
 
 
 def parse_query_date(query: str) -> str | None:
     """Extract a normalized ISO date from a user query if one is present."""
+    normalized_query = (query or "").strip()
+    for aliases, day_offset in RELATIVE_DATE_OFFSETS:
+        if any(alias in normalized_query for alias in aliases):
+            return (date.today() + timedelta(days=day_offset)).isoformat()
+
     for pattern in QUERY_DATE_PATTERNS:
-        match = pattern.search(query)
+        match = pattern.search(normalized_query)
         if not match:
             continue
         groups = match.groupdict()
@@ -110,9 +141,16 @@ def parse_query_date(query: str) -> str | None:
         month = int(groups["month"])
         day = int(groups["day"])
         try:
-            return date(year, month, day).isoformat()
+            parsed = date(year, month, day)
         except ValueError:
             return None
+        # If the inferred date is in the future and no explicit year was given, use last year
+        if not groups.get("year") and parsed > date.today():
+            try:
+                parsed = date(year - 1, month, day)
+            except ValueError:
+                return None
+        return parsed.isoformat()
     return None
 
 
@@ -198,6 +236,7 @@ class DocumentRetriever:
                 logger.warning("Vector indexing unavailable, fallback to lexical retrieval: %s", exc)
 
         self._indexed = True
+        self._rebuild_fact_index()
         return {
             "status": "indexed",
             "document_count": len(self._documents),
@@ -330,6 +369,7 @@ class DocumentRetriever:
 
         self._save_index_state(self._build_index_state())
         self._indexed = True
+        self._rebuild_fact_index()
 
         return {
             "status": "incremental",
@@ -412,6 +452,47 @@ class DocumentRetriever:
             except Exception as exc:
                 logger.warning("Full rebuild vector index failed: %s", exc)
 
+    def _rebuild_fact_index(self) -> None:
+        """Trigger DocFactIndex rebuild from the in-memory document list."""
+        try:
+            from services.doc_fact_index import get_doc_fact_index
+
+            fact_index = get_doc_fact_index()
+            # Build full-document payloads for fact extraction
+            full_docs = []
+            for document in self._documents:
+                metadata = document.get("metadata", {})
+                filename = metadata.get("filename", "")
+                parsed = parse_document_metadata(filename)
+                full_docs.append({
+                    "content": document.get("content", ""),
+                    "metadata": {**metadata, **parsed},
+                })
+            result = fact_index.rebuild(full_docs)
+            logger.info("DocFactIndex rebuild: %s", result)
+        except Exception as exc:
+            logger.warning("DocFactIndex rebuild skipped: %s", exc)
+
+    def find_documents_in_range(
+        self, date_from: str, date_to: str
+    ) -> list[dict[str, Any]]:
+        """Return documents whose published_at falls in [date_from, date_to]."""
+        if not self._indexed:
+            self.index_documents_incremental()
+        docs = self.list_documents()
+        return [
+            item for item in docs
+            if item.get("published_at", "") and date_from <= item["published_at"] <= date_to
+        ]
+
+    def find_latest_date(self) -> str:
+        """Return the most recent published_at date across all documents."""
+        docs = self.list_documents()
+        for item in docs:
+            if item.get("published_at"):
+                return item["published_at"]
+        return ""
+
     def get_stats(self) -> dict[str, Any]:
         if not self._indexed:
             return self.index_documents_incremental()
@@ -442,12 +523,33 @@ class DocumentRetriever:
         docs.sort(key=lambda item: (item.get("published_at") or "", item["filename"]), reverse=True)
         return docs
 
-    def find_latest_documents(self) -> list[dict[str, Any]]:
+    def find_latest_documents(
+        self,
+        days: int | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         docs = self.list_documents()
         latest_date = next((item["published_at"] for item in docs if item.get("published_at")), "")
         if not latest_date:
             return []
-        return [item for item in docs if item.get("published_at") == latest_date]
+
+        if days is None or days <= 1:
+            results = [item for item in docs if item.get("published_at") == latest_date]
+        else:
+            latest = date.fromisoformat(latest_date)
+            # Inclusive window: "recent N days" includes today as day 1.
+            start = (latest - timedelta(days=max(days - 1, 0))).isoformat()
+            results = [
+                item
+                for item in docs
+                if item.get("published_at") and start <= item["published_at"] <= latest_date
+            ]
+
+        max_results = limit if limit is not None else MAX_RETRIEVAL_RESULTS_WINDOW
+        if max_results > 0:
+            return results[:max_results]
+        return results
 
     def list_documents_by_date(self, published_at: str) -> list[dict[str, Any]]:
         docs = self.list_documents()

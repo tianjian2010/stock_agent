@@ -51,6 +51,35 @@ const STREAMING_PLACEHOLDER: StreamingAssistantMessage = {
   isStreaming: true,
 };
 
+async function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  retries = 2
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetch(input, init);
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      const isNetworkError =
+        error instanceof TypeError || message.toLowerCase().includes('failed to fetch');
+      if (!isNetworkError || attempt === retries) {
+        throw error;
+      }
+      await sleep(400 * (attempt + 1));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('Failed to fetch');
+}
+
 function parseSseBlocks(buffer: string): {
   events: Array<{ event: string; data: string }>;
   remainder: string;
@@ -107,7 +136,7 @@ export function useChatStream(options: UseChatStreamOptions = {}) {
       abortControllerRef.current = new AbortController();
 
       try {
-        const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
+        const response = await fetchWithRetry(`${API_BASE_URL}/api/chat/stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ query, thread_id: threadId }),

@@ -14,23 +14,55 @@ from agents.stock_agent.runtime import (
 
 
 class StockAgentRuntimeTests(unittest.TestCase):
+    def test_build_agent_plan_routes_symbol_lookup_query(self) -> None:
+        plan = build_agent_plan("688678是什么股票")
+        self.assertFalse(plan.use_document_search)
+        self.assertEqual(plan.intent, "market_symbol_lookup")
+        self.assertEqual(len(plan.planned_tools), 1)
+        self.assertEqual(plan.planned_tools[0].name, "mx_search")
+
+    def test_build_agent_plan_routes_reference_symbol_lookup_query(self) -> None:
+        plan = build_agent_plan("把上面代码对应的股票名称显示出来")
+        self.assertFalse(plan.use_document_search)
+        self.assertEqual(plan.intent, "market_symbol_lookup")
+        self.assertEqual(len(plan.planned_tools), 1)
+        self.assertEqual(plan.planned_tools[0].name, "mx_search")
+
+    def test_build_agent_plan_does_not_misroute_research_analysis_with_stock_code(self) -> None:
+        plan = build_agent_plan("结合研报分析603019走势")
+        self.assertTrue(plan.use_document_search)
+        self.assertEqual(plan.intent, "market_augmented_analysis")
+        self.assertEqual(len(plan.planned_tools), 1)
+        self.assertEqual(plan.planned_tools[0].name, "mx_market_state")
+
     def test_build_agent_plan_routes_documents_by_date_query(self) -> None:
-        plan = build_agent_plan("5/8日的资料有哪一些？")
+        plan = build_agent_plan("5/8\u65e5\u7684\u8d44\u6599\u6709\u54ea\u4e9b\uff1f")
         self.assertEqual(plan.direct_answer_mode, "documents_by_date")
         self.assertFalse(plan.use_document_search)
         self.assertEqual(plan.intent, "document_catalog_by_date")
 
     def test_build_agent_plan_routes_latest_document_query(self) -> None:
-        plan = build_agent_plan("最近的投研文档有哪些")
+        plan = build_agent_plan("\u6700\u8fd1\u7684\u6295\u7814\u6587\u6863\u6709\u54ea\u4e9b\uff1f")
         self.assertEqual(plan.direct_answer_mode, "latest_documents")
         self.assertFalse(plan.use_document_search)
         self.assertEqual(plan.intent, "document_catalog_latest")
 
     def test_build_agent_plan_routes_document_count_query(self) -> None:
-        plan = build_agent_plan("现在有多少个投研报告")
+        plan = build_agent_plan("\u73b0\u5728\u6709\u591a\u5c11\u4e2a\u6295\u7814\u62a5\u544a")
         self.assertEqual(plan.direct_answer_mode, "count_documents")
         self.assertFalse(plan.use_document_search)
         self.assertEqual(plan.intent, "document_catalog_count")
+
+    def test_build_agent_plan_does_not_direct_answer_complex_date_analysis_query(self) -> None:
+        plan = build_agent_plan(
+            "4月16日以后到5月9日前所有关于半导体的研报，把内容总结出来，"
+            "我需要知道哪些股票是值得投，另外列一下各个股票在这段时间内的涨幅、"
+            "是否历史最高，还有当前股价"
+        )
+        self.assertIsNone(plan.direct_answer_mode)
+        self.assertTrue(plan.use_document_search)
+        self.assertEqual(plan.intent, "market_augmented_analysis")
+        self.assertEqual([tool.name for tool in plan.planned_tools], ["mx_data_price"])
 
     def test_build_agent_plan_routes_screener_query(self) -> None:
         plan = build_agent_plan("帮我筛选低估值的创新药股票")

@@ -1,4 +1,4 @@
-"""Runtime primitives for the stock research agent system."""
+﻿"""Runtime primitives for the stock research agent system."""
 
 from __future__ import annotations
 
@@ -7,42 +7,46 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.config import LLM_PLANNER_MAX_STAGES
+from agents.stock_agent.time_router import IntentType, classify_intent
 
 DOCUMENT_TERMS = (
-    "研报",
-    "资料",
-    "文档",
-    "投研",
-    "文件",
-    "报告",
+    "\u7814\u62a5",
+    "\u7814\u7a76\u62a5",
+    "\u7814\u7a76\u62a5\u544a",
+    "\u8d44\u6599",
+    "\u6587\u6863",
+    "\u6295\u7814",
+    "\u6587\u4ef6",
+    "\u62a5\u544a",
 )
 ANALYSIS_TERMS = (
-    "分析",
-    "总结",
-    "解读",
-    "怎么看",
-    "逻辑",
-    "原因",
-    "影响",
-    "判断",
+    "\u5206\u6790",
+    "\u603b\u7ed3",
+    "\u89e3\u8bfb",
+    "\u600e\u4e48\u770b",
+    "\u903b\u8f91",
+    "\u539f\u56e0",
+    "\u5f71\u54cd",
+    "\u5224\u65ad",
 )
 LATEST_DOCUMENT_TERMS = (
-    "最近",
-    "最新",
-    "近期",
+    "\u6700\u8fd1",
+    "\u6700\u65b0",
+    "\u65b0",
+    "\u8fd1\u671f",
 )
 LIST_DOCUMENT_TERMS = (
-    "列出",
-    "清单",
-    "有哪些",
-    "有哪几篇",
+    "\u5217\u51fa",
+    "\u6e05\u5355",
+    "\u6709\u54ea\u4e9b",
+    "\u6709\u54ea\u51e0\u7bc7",
 )
 COUNT_DOCUMENT_TERMS = (
-    "多少",
-    "几个",
-    "几份",
-    "数量",
-    "总数",
+    "\u591a\u5c11",
+    "\u51e0\u4e2a",
+    "\u51e0\u4efd",
+    "\u6570\u91cf",
+    "\u603b\u6570",
 )
 MARKET_KEYWORDS = {
     "price": (
@@ -52,6 +56,23 @@ MARKET_KEYWORDS = {
         "现价",
         "涨跌",
         "报价",
+        "突破",
+        "新高",
+        "新低",
+        "最高价",
+        "最低价",
+        "走势",
+        "趋势",
+        "涨势",
+        "跌势",
+        "震荡",
+        "回调",
+        "反弹",
+        "支撑位",
+        "压力位",
+        "均线",
+        "技术面",
+        "K线",
     ),
     "finance": (
         "财务",
@@ -81,6 +102,24 @@ MARKET_KEYWORDS = {
         "条件股",
     ),
 }
+DIRECT_ANSWER_BLOCK_TERMS = (
+    *ANALYSIS_TERMS,
+    "总结",
+    "归纳",
+    "梳理",
+    "值得投",
+    "股票",
+    "个股",
+    "标的",
+    "行情",
+    "股价",
+    "价格",
+    "现价",
+    "涨幅",
+    "涨跌",
+    "历史最高",
+    "新高",
+)
 KEYWORD_PATTERN = re.compile(r"[A-Za-z0-9]{2,}|[\u4e00-\u9fff]{2,}")
 STOP_WORDS = {
     "关于",
@@ -111,13 +150,38 @@ FILENAME_PATTERN = re.compile(
 QUERY_DATE_PATTERN = re.compile(
     r"(20\d{2}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日?|\d{1,2}月\d{1,2}日?)"
 )
-STOCK_CODE_PATTERN = re.compile(r"\b\d{6}\b")
+RELATIVE_DATE_TERMS = ("今天", "今日", "当天", "昨天", "昨日", "明天", "明日")
+DATE_LIST_INTENT_TERMS = ("每个", "逐个", "整理", "显示", "列出", "清单", "看看")
+STOCK_CODE_PATTERN = re.compile(r"(?<!\d)\d{6}(?!\d)")
+SYMBOL_LOOKUP_TERMS = (
+    "是什么股票",
+    "什么股票",
+    "对应什么股票",
+    "对应的股票",
+    "股票名称",
+    "股票名",
+    "简称",
+    "全称",
+    "叫什么",
+)
+SYMBOL_REFERENCE_TERMS = ("上面", "这些", "前面", "刚才", "上述")
+SYMBOL_LOOKUP_EXCLUDE_TERMS = DOCUMENT_TERMS + ANALYSIS_TERMS + (
+    "走势",
+    "趋势",
+    "涨跌",
+    "涨幅",
+    "估值",
+    "财务",
+    "资金流",
+    "研判",
+)
 ALLOWED_STAGE_TYPES = {"retrieval", "tool"}
 ALLOWED_WORKERS = {
     "document_researcher",
     "market_analyst",
     "news_analyst",
     "stock_screener",
+    "market_state_checker",
 }
 
 
@@ -194,6 +258,7 @@ class AgentTask:
     order: int
     depends_on: list[str] = field(default_factory=list)
     stage_id: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -649,6 +714,8 @@ def _build_tool_stage_title(tool_name: str) -> str:
         return "核查财务与估值"
     if tool_name == "mx_data_price":
         return "核查实时行情"
+    if tool_name == "mx_market_state":
+        return "研判行情趋势与突破"
     return f"执行工具 {tool_name}"
 
 
@@ -657,30 +724,50 @@ def _resolve_tool_worker(tool_name: str) -> str:
         return "news_analyst"
     if tool_name == "mx_select_stock":
         return "stock_screener"
+    if tool_name == "mx_market_state":
+        return "market_state_checker"
     return "market_analyst"
 
 
 def _detect_direct_answer_mode(query: str) -> str | None:
+    # 0. Check time-router intents first (window_stats, daily_digest)
+    intent_result = classify_intent(query)
+    if intent_result.intent == IntentType.WINDOW_STATS:
+        return "window_stats"
+    if intent_result.intent == IntentType.DAILY_DIGEST:
+        return "daily_digest"
+
     has_document_term = any(term in query for term in DOCUMENT_TERMS)
     has_list_term = any(term in query for term in LIST_DOCUMENT_TERMS)
-    has_date = QUERY_DATE_PATTERN.search(query) is not None
+    has_relative_date = any(term in query for term in RELATIVE_DATE_TERMS)
+    has_date = QUERY_DATE_PATTERN.search(query) is not None or has_relative_date
+    has_date_list_intent = any(term in query for term in DATE_LIST_INTENT_TERMS)
+    has_block_term = any(term in query for term in DIRECT_ANSWER_BLOCK_TERMS)
 
-    if has_date and has_document_term and (
-        has_list_term or any(term in query for term in ("哪", "哪些", "有", "看看"))
+    if not has_block_term and has_date and has_document_term and (
+        has_list_term
+        or has_date_list_intent
+        or any(term in query for term in ("哪", "哪些", "有", "看看"))
     ):
         return "documents_by_date"
 
     if (
-        any(term in query for term in LATEST_DOCUMENT_TERMS)
+        not has_block_term
+        and any(term in query for term in LATEST_DOCUMENT_TERMS)
         and has_document_term
         and any(term in query for term in ("哪些", "哪几篇", "清单", "列出", "一批"))
     ):
         return "latest_documents"
 
-    if any(term in query for term in COUNT_DOCUMENT_TERMS) and has_document_term:
+    if (
+        not has_block_term
+        and any(term in query for term in COUNT_DOCUMENT_TERMS)
+        and has_document_term
+        and not any(term in query for term in ("哪些", "哪几篇", "有哪些", "列出", "清单"))
+    ):
         return "count_documents"
 
-    if has_list_term and has_document_term:
+    if not has_block_term and has_list_term and has_document_term:
         return "list_documents"
 
     if FILENAME_PATTERN.search(query):
@@ -691,6 +778,15 @@ def _detect_direct_answer_mode(query: str) -> str | None:
 
 def _plan_tools(query: str) -> list[PlannedTool]:
     planned_tools: list[PlannedTool] = []
+
+    if _is_symbol_lookup_query(query):
+        return [
+            PlannedTool(
+                name="mx_search",
+                query=f"{query} 股票代码 对应 股票名称",
+                reason="用户在查询股票代码对应的股票名称，优先走妙想快速映射。",
+            )
+        ]
 
     if any(word in query for word in MARKET_KEYWORDS["screener"]):
         return [
@@ -710,7 +806,17 @@ def _plan_tools(query: str) -> list[PlannedTool]:
             )
         )
 
-    if any(word in query for word in MARKET_KEYWORDS["money_flow"]):
+    # Market state check: trend/breakout keywords take priority
+    _trend_terms = ("突破", "新高", "新低", "走势", "趋势", "涨势", "跌势", "震荡", "均线", "技术面")
+    if any(word in query for word in _trend_terms):
+        planned_tools.append(
+            PlannedTool(
+                name="mx_market_state",
+                query=query,
+                reason="用户询问突破、趋势或技术面，需要进行行情研判。",
+            )
+        )
+    elif any(word in query for word in MARKET_KEYWORDS["money_flow"]):
         planned_tools.append(
             PlannedTool(
                 name="mx_data_money_flow",
@@ -749,6 +855,9 @@ def _should_use_document_search(
     if direct_answer_mode is not None:
         return False
 
+    if _is_symbol_lookup_query(query):
+        return False
+
     if any(term in query for term in DOCUMENT_TERMS + ANALYSIS_TERMS):
         return True
 
@@ -785,6 +894,10 @@ def _classify_intent(
     planned_tools: list[PlannedTool],
     use_document_search: bool,
 ) -> str:
+    if direct_answer_mode == "window_stats":
+        return "document_catalog_window_stats"
+    if direct_answer_mode == "daily_digest":
+        return "document_catalog_daily_digest"
     if direct_answer_mode == "documents_by_date":
         return "document_catalog_by_date"
     if direct_answer_mode == "latest_documents":
@@ -797,10 +910,49 @@ def _classify_intent(
         return "document_lookup"
 
     tool_names = {tool.name for tool in planned_tools}
+    if _is_symbol_lookup_plan(planned_tools):
+        return "market_symbol_lookup"
     if "mx_select_stock" in tool_names:
         return "stock_screening"
-    if tool_names & {"mx_search", "mx_data_money_flow", "mx_data_finance", "mx_data_price"}:
+    if tool_names & {
+        "mx_search",
+        "mx_data_money_flow",
+        "mx_data_finance",
+        "mx_data_price",
+        "mx_market_state",
+    }:
         return "market_augmented_analysis" if use_document_search else "market_lookup"
     if use_document_search:
         return "research_analysis"
     return "general_answer"
+
+
+def _is_symbol_lookup_plan(planned_tools: list[PlannedTool]) -> bool:
+    return any(
+        tool.name == "mx_search" and "股票代码 对应 股票名称" in tool.query
+        for tool in planned_tools
+    )
+
+
+def _is_symbol_lookup_query(query: str) -> bool:
+    has_code = STOCK_CODE_PATTERN.search(query) is not None
+    has_lookup_term = any(term in query for term in SYMBOL_LOOKUP_TERMS)
+    has_code_word = "代码" in query or "证券代码" in query
+    has_reference = any(term in query for term in SYMBOL_REFERENCE_TERMS)
+    has_exclude = any(term in query for term in SYMBOL_LOOKUP_EXCLUDE_TERMS)
+
+    if has_exclude:
+        return False
+
+    if has_code and (has_lookup_term or has_code_word):
+        return True
+
+    if has_lookup_term and has_code_word:
+        return True
+
+    if has_reference and has_code_word and any(term in query for term in ("名称", "简称", "全称", "叫什么")):
+        return True
+
+    return False
+
+

@@ -1,8 +1,15 @@
 import unittest
+from unittest.mock import Mock
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from services.llm import OpenAICompatibleEmbeddings, _normalize_minimax_base_url
+from services.llm import (
+    OpenAICompatibleEmbeddings,
+    _normalize_minimax_base_url,
+    _llm_error_details,
+    describe_minimax_chat_config,
+    diagnose_minimax_auth,
+)
 from services.vector_store import VectorStoreService
 
 
@@ -20,11 +27,68 @@ class _FakeEmbeddingsAPI:
 
 
 class OpenAICompatibleEmbeddingsTests(unittest.TestCase):
-    def test_normalize_minimax_base_url_rewrites_legacy_domain(self) -> None:
+    def test_llm_error_details_classifies_bad_base_url(self) -> None:
+        error = Exception("404 not found")
+
+        details = _llm_error_details(error)
+
+        self.assertEqual(details["category"], "bad_base_url")
+        self.assertEqual(details["error_type"], "Exception")
+        self.assertEqual(details["status_code"], "unknown")
+
+    def test_normalize_minimax_base_url_preserves_official_domain(self) -> None:
         self.assertEqual(
             _normalize_minimax_base_url("https://api.minimaxi.com/v1"),
-            "https://api.minimax.io/v1",
+            "https://api.minimaxi.com/v1",
         )
+
+    @patch("services.llm.MINIMAX_API_KEY", "sk-test-1234567890")
+    @patch("services.llm.MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+    @patch("services.llm.MINIMAX_MODEL", "MiniMax-M2.7")
+    def test_describe_minimax_chat_config_preserves_base_url(self) -> None:
+        config = describe_minimax_chat_config()
+
+        self.assertEqual(config["base_url"], "https://api.minimaxi.com/v1")
+        self.assertEqual(config["base_url_source"], "https://api.minimaxi.com/v1")
+        self.assertTrue(config["api_key_present"])
+        self.assertTrue(config["api_key_preview"].startswith("sk-t"))
+
+    @patch("services.llm.MINIMAX_API_KEY", "")
+    def test_diagnose_minimax_auth_reports_missing_key(self) -> None:
+        result = diagnose_minimax_auth()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["category"], "missing_api_key")
+
+    @patch("services.llm.OpenAI")
+    @patch("services.llm.MINIMAX_API_KEY", "sk-test-1234567890")
+    @patch("services.llm.MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+    @patch("services.llm.MINIMAX_MODEL", "MiniMax-M2.7")
+    def test_diagnose_minimax_auth_reports_invalid_key(self, openai_cls: Mock) -> None:
+        client = Mock()
+        client.chat.completions.create.side_effect = Exception(
+            "Error code: 401 - {'error': {'message': 'invalid api key (2049)'}}"
+        )
+        openai_cls.return_value = client
+
+        result = diagnose_minimax_auth()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["category"], "invalid_api_key")
+
+    @patch("services.llm.OpenAI")
+    @patch("services.llm.MINIMAX_API_KEY", "sk-test-1234567890")
+    @patch("services.llm.MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+    @patch("services.llm.MINIMAX_MODEL", "MiniMax-M2.7")
+    def test_diagnose_minimax_auth_reports_success(self, openai_cls: Mock) -> None:
+        client = Mock()
+        client.chat.completions.create.return_value = SimpleNamespace(choices=[])
+        openai_cls.return_value = client
+
+        result = diagnose_minimax_auth()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["category"], "ok")
 
     def test_minimax_native_payload_uses_texts_and_query_type(self) -> None:
         model = OpenAICompatibleEmbeddings(

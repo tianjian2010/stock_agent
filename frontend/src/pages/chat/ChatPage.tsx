@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { History, PanelRightOpen, Plus, Sparkles, X } from 'lucide-react';
@@ -42,6 +42,7 @@ export default function ChatPage() {
   const [trace, setTrace] = useState<TraceStep[]>([]);
   const [recovery, setRecovery] = useState<Record<string, unknown> | undefined>();
   const [titleOverride, setTitleOverride] = useState<string | null>(null);
+  const autoQuerySentRef = useRef(false);
 
   const { data: threadData } = useQuery({
     queryKey: ['thread', threadId],
@@ -96,6 +97,7 @@ export default function ChatPage() {
     setRecovery(undefined);
     setTitleOverride(null);
     setRightPanelOpen(false);
+    autoQuerySentRef.current = false;
   }, [threadId, setMessages]);
 
   useEffect(() => {
@@ -125,10 +127,12 @@ export default function ChatPage() {
     if (threadId !== 'new') return;
 
     const query = searchParams.get('query');
-    if (query && messages.length === 0) {
+    if (query && messages.length === 0 && !autoQuerySentRef.current) {
+      autoQuerySentRef.current = true;
       sendMessage(query);
+      navigate('/chat/new', { replace: true });
     }
-  }, [messages.length, searchParams, sendMessage, threadId]);
+  }, [messages.length, navigate, searchParams, sendMessage, threadId]);
 
   const handleSend = useCallback(
     (query: string) => {

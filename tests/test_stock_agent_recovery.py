@@ -195,6 +195,166 @@ class StockAgentRecoveryTests(unittest.TestCase):
         self.assertIn("1 个阶段已降级恢复", answer)
         self.assertIn("建议动作", answer)
 
+    def test_inline_citation_labels_adds_default_label_to_uncited_paragraph(self) -> None:
+        agent = StockAgent()
+
+        answer = "第一段结论。\n\n第二段展开说明。"
+        citations = [
+            {"filename": "福瑞医科0508.txt", "published_at": "2026-05-08", "chunk_id": 0, "total_chunks": 3}
+        ]
+
+        updated = agent._inline_citation_labels(answer, citations)
+
+        self.assertIn("第一段结论。[资料1]", updated)
+        self.assertIn("第二段展开说明。[资料1]", updated)
+
+    def test_inline_citation_labels_keeps_existing_inline_reference(self) -> None:
+        agent = StockAgent()
+
+        answer = "第一段结论[资料2]。\n\n第二段展开说明。"
+        citations = [
+            {"filename": "福瑞医科0508.txt", "published_at": "2026-05-08", "chunk_id": 0, "total_chunks": 3},
+            {"filename": "国芯科技0507.txt", "published_at": "2026-05-07", "chunk_id": 1, "total_chunks": 4},
+        ]
+
+        updated = agent._inline_citation_labels(answer, citations)
+
+        self.assertEqual(updated.count("[资料2]"), 1)
+        self.assertIn("第二段展开说明。[资料1]", updated)
+
+    def test_inline_citation_labels_prefers_best_matching_document(self) -> None:
+        agent = StockAgent()
+
+        answer = "国芯的抗量子金融POS机已经量产出货。"
+        citations = [
+            {
+                "filename": "福瑞医科0508.txt",
+                "topic": "福瑞医科",
+                "published_at": "2026-05-08",
+                "chunk_id": 0,
+                "total_chunks": 3,
+                "snippet": "Echosens中国分公司调研纪要反馈，国内公立医院招投标中标数量增长40%。",
+            },
+            {
+                "filename": "国芯科技0507.txt",
+                "topic": "国芯科技",
+                "published_at": "2026-05-07",
+                "chunk_id": 1,
+                "total_chunks": 4,
+                "snippet": "国芯科技实现抗量子金融POS机芯片CUni360SQ-ZX量产出货。",
+            },
+        ]
+
+        updated = agent._inline_citation_labels(answer, citations)
+
+        self.assertIn("[资料2]", updated)
+
+    def test_build_evidence_scope_context_for_single_topic(self) -> None:
+        agent = StockAgent()
+        citations = [
+            {"filename": "福瑞医科0508.txt", "topic": "福瑞医科"},
+            {"filename": "福瑞医科0428.docx", "topic": "福瑞医科"},
+        ]
+
+        context = agent._build_evidence_scope_context(citations)
+
+        self.assertIn("同一主题的多篇文档", context)
+        self.assertIn("福瑞医科", context)
+
+    def test_build_evidence_scope_context_for_multi_topic(self) -> None:
+        agent = StockAgent()
+        citations = [
+            {"filename": "福瑞医科0508.txt", "topic": "福瑞医科"},
+            {"filename": "国芯科技0507.txt", "topic": "国芯科技"},
+        ]
+
+        context = agent._build_evidence_scope_context(citations)
+
+        self.assertIn("多个不同主题", context)
+        self.assertIn("按主题分组说明", context)
+
+    def test_filter_citations_by_answer_usage_removes_unused_items(self) -> None:
+        agent = StockAgent()
+        citations = [
+            {"filename": "福瑞医科0508.txt", "citation_index": 1},
+            {"filename": "福瑞医科0428.docx", "citation_index": 2},
+            {"filename": "福瑞医科0420.txt", "citation_index": 3},
+        ]
+
+        filtered = agent._filter_citations_by_answer_usage(
+            "结论来自[资料1]，补充说明见[资料3]。",
+            citations,
+        )
+
+        self.assertEqual([item["filename"] for item in filtered], ["福瑞医科0508.txt", "福瑞医科0420.txt"])
+
+    def test_build_citation_note_preserves_original_citation_index(self) -> None:
+        agent = StockAgent()
+        note = agent._build_citation_note(
+            [
+                {"filename": "福瑞医科0508.txt", "citation_index": 1},
+                {"filename": "福瑞医科0420.txt", "citation_index": 3},
+            ]
+        )
+
+        self.assertIn("[资料1] 福瑞医科0508.txt", note)
+        self.assertIn("[资料3] 福瑞医科0420.txt", note)
+
+    def test_inline_citation_labels_skips_heading_like_blocks(self) -> None:
+        agent = StockAgent()
+        answer = "一、国内设备销售\n\n招投标数量同比高增长。"
+        citations = [{"filename": "福瑞医科0508.txt", "citation_index": 1}]
+
+        updated = agent._inline_citation_labels(answer, citations)
+
+        self.assertIn("一、国内设备销售", updated)
+        self.assertNotIn("一、国内设备销售[资料1]", updated)
+        self.assertIn("招投标数量同比高增长。[资料1]", updated)
+
+    def test_normalize_inline_citation_format_wraps_plain_labels(self) -> None:
+        agent = StockAgent()
+
+        updated = agent._normalize_inline_citation_format("核心结论 资料1，补充见资料3。")
+
+        self.assertEqual(updated, "核心结论 [资料1]，补充见[资料3]。")
+
+    def test_rewrite_inference_citation_style_moves_citations_into_prefix(self) -> None:
+        agent = StockAgent()
+
+        updated = agent._rewrite_inference_citation_style("判断： 这一趋势会持续。 [资料1] [资料3]")
+
+        self.assertEqual(updated, "判断（基于[资料1]、[资料3]）：这一趋势会持续。")
+
+    def test_strip_heading_trailing_citations_removes_heading_suffix_only(self) -> None:
+        agent = StockAgent()
+        answer = "一、国内设备销售 [资料1]\n招投标数量同比高增长。[资料1]"
+
+        updated = agent._strip_heading_trailing_citations(answer)
+
+        self.assertIn("一、国内设备销售", updated)
+        self.assertNotIn("一、国内设备销售 [资料1]", updated)
+        self.assertIn("招投标数量同比高增长。[资料1]", updated)
+
+    def test_realistic_stock_answer_post_processing_removes_heading_suffixes(self) -> None:
+        agent = StockAgent()
+        answer = """福瑞医科近期经营边际变化综合分析 [资料3]
+一、核心结论
+短期财务指标承压，但业务基本面出现积极边际改善。 [资料1]
+
+二、收入端：增速回落但订单质量显著提升 [资料1]
+财务数据表面平淡：一季报归母净利润3200万元、同比增长11%，投研部评价为“较差数据”[资料2]。
+判断：短期报表增速放缓主要受会计处理影响。 [资料2]
+"""
+
+        updated = agent._normalize_inline_citation_format(answer)
+        updated = agent._strip_heading_trailing_citations(updated)
+        updated = agent._rewrite_inference_citation_style(updated)
+
+        self.assertNotIn("综合分析 [资料3]", updated)
+        self.assertNotIn("提升 [资料1]", updated)
+        self.assertIn("短期财务指标承压，但业务基本面出现积极边际改善。 [资料1]", updated)
+        self.assertIn("判断（基于[资料2]）：短期报表增速放缓主要受会计处理影响。", updated)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,41 +10,41 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.chat import router as chat_router
 from app.api.admin import router as admin_router
+from app.config import LLM_STARTUP_HEALTHCHECK
 from app.life import get_scheduler
+from app.logging_setup import configure_logging
 from services.document_retriever import get_document_retriever
+from services.llm import diagnose_minimax_auth
 
-
-# Configure logging so that all modules' logger.info/warning/error appear in console
-_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, _log_level, logging.INFO),
-    format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-# Silence overly noisy libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("chromadb").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING)
+LOG_FILE_PATH = configure_logging()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """FastAPI lifespan: startup indexing + periodic background refresh, shutdown cleanup."""
-    # Startup: run initial incremental index
-    retriever = get_document_retriever()
-    result = retriever.index_documents_incremental()
-    logging.info(
-        "Startup indexing: status=%s, docs=%d, chunks=%d, vector_ready=%s, updated=%d",
-        result.get("status"),
-        result.get("document_count", 0),
-        result.get("chunk_count", 0),
-        result.get("vector_ready"),
-        result.get("updated_files", 0),
-    )
+    """FastAPI lifespan: fast startup + background indexing, then shutdown cleanup."""
+    if LOG_FILE_PATH is not None:
+        logging.info("File logging enabled: %s", LOG_FILE_PATH)
+    if LLM_STARTUP_HEALTHCHECK:
+        llm_diag = diagnose_minimax_auth()
+        level = logging.INFO if llm_diag.get("ok") else logging.WARNING
+        logging.log(
+            level,
+            "MiniMax startup health: ok=%s, category=%s, model=%s, base_url=%s, api_key=%s, source_base_url=%s, detail=%s",
+            llm_diag.get("ok"),
+            llm_diag.get("category"),
+            llm_diag.get("model"),
+            llm_diag.get("base_url"),
+            llm_diag.get("api_key_preview"),
+            llm_diag.get("base_url_source"),
+            llm_diag.get("message"),
+        )
 
-    # Start background periodic indexing
+    # Start background indexing without blocking API readiness.
+    get_document_retriever()
     scheduler = get_scheduler()
     scheduler.start_periodic(get_document_retriever)
+    logging.info("Startup indexing delegated to background scheduler.")
+    logging.info("BACKEND READY: API can accept requests.")
 
     yield
 
@@ -81,4 +81,4 @@ def health_check() -> dict[str, str]:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)

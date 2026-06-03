@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import queue
+import threading
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
+from time import perf_counter
 from typing import Any
 
 from agents.stock_agent.agent import get_stock_agent, run_stock_query_sync
@@ -19,6 +23,7 @@ from sse_starlette.sse import EventSourceResponse
 from services.db import get_chat_db
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 
 def _utc_now() -> str:
@@ -120,17 +125,25 @@ def _ensure_chat_exists(thread_id: str) -> None:
 def _resolve_title(thread_id: str, request: ChatRequest, query: str) -> str:
     chat_db = get_chat_db()
     agent = get_stock_agent()
+    title_generator = getattr(agent, "generate_sidebar_title", None) or agent.generate_title
     default_title = "新对话"
 
     if not request.thread_id:
-        title = agent.generate_title(query)
+        title = title_generator(query)
         chat_db.update_chat_title(thread_id, title)
         return title
 
     chat_record = chat_db.get_chat(thread_id)
     current_title = str(chat_record.get("title") or "").strip() if chat_record else ""
-    if not current_title or current_title == default_title:
-        title = agent.generate_title(query)
+    if (
+        not current_title
+        or current_title == default_title
+        or "theuser" in current_title.lower().replace(" ", "")
+        or "wantsme" in current_title.lower().replace(" ", "")
+        or "15个字以内" in current_title
+        or current_title.lower().replace(" ", "").startswith("ref")
+    ):
+        title = title_generator(query)
         chat_db.update_chat_title(thread_id, title)
         return title
     return current_title
@@ -240,11 +253,18 @@ def chat_stream(request: ChatRequest) -> EventSourceResponse:
     chat_db = get_chat_db()
     thread_id = request.thread_id or str(uuid.uuid4())
     created_at = _utc_now()
+    request_started_at = perf_counter()
 
     _ensure_chat_exists(thread_id)
     chat_db.add_message(thread_id=thread_id, role="user", content=request.query)
 
     async def event_generator():
+        logger.info(
+            "stream_chat_started thread_id=%s has_existing_thread=%s query_preview=%r",
+            thread_id,
+            bool(request.thread_id),
+            request.query[:80],
+        )
         yield {
             "event": "message_start",
             "data": _json_event({"thread_id": thread_id, "created_at": created_at}),
@@ -253,46 +273,135 @@ def chat_stream(request: ChatRequest) -> EventSourceResponse:
         try:
             loop = asyncio.get_running_loop()
             agent = get_stock_agent()
-            progress_events: list[dict[str, Any]] = []
+            stream_queue: queue.Queue[Any] = queue.Queue()
+            prepared_sentinel = object()
 
             def record_progress(event_name: str, payload: dict[str, Any]) -> None:
-                progress_events.append({"event": event_name, "payload": payload})
+                stream_queue.put(
+                    {
+                        "event": "status",
+                        "data": _json_event({"event": event_name, "payload": payload}),
+                    }
+                )
 
-            prepared = await loop.run_in_executor(
-                None,
-                lambda: agent.prepare_answer_context(
-                    request.query,
-                    thread_id=thread_id,
-                    progress_callback=record_progress,
-                ),
+            def produce_prepared_context() -> None:
+                try:
+                    prepared = agent.prepare_answer_context(
+                        request.query,
+                        thread_id=thread_id,
+                        progress_callback=record_progress,
+                    )
+                    stream_queue.put(prepared)
+                except Exception as exc:
+                    stream_queue.put(exc)
+                finally:
+                    stream_queue.put(prepared_sentinel)
+
+            preparation_thread = threading.Thread(target=produce_prepared_context, daemon=True)
+            preparation_thread.start()
+
+            prepared = None
+            preparation_started_at = perf_counter()
+            while True:
+                item = await loop.run_in_executor(None, stream_queue.get)
+                if item is prepared_sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                if isinstance(item, dict) and "event" in item and "data" in item:
+                    yield item
+                    continue
+                prepared = item
+
+            if prepared is None:
+                raise RuntimeError("Preparation finished without a prepared answer context.")
+            preparation_elapsed_ms = round((perf_counter() - preparation_started_at) * 1000, 1)
+            logger.info(
+                "stream_chat_prepared thread_id=%s elapsed_ms=%s direct_answer=%s citations=%s tools=%s planner=%s",
+                thread_id,
+                preparation_elapsed_ms,
+                prepared.direct_answer is not None,
+                len(prepared.citations),
+                len(prepared.tool_results),
+                prepared.plan.planner_source,
             )
-            title = _resolve_title(thread_id, request, request.query)
+            title = _resolve_title(thread_id, request, request.query) if request.thread_id else None
             answer_chunks: list[str] = []
             result_metadata = _serialize_prepared_metadata(prepared)
 
-            for progress_event in progress_events:
-                yield {
-                    "event": "status",
-                    "data": _json_event(progress_event),
-                }
-
             if prepared.direct_answer is not None:
                 answer_chunks.append(prepared.direct_answer)
+                logger.info(
+                    "stream_chat_direct_answer thread_id=%s chars=%s elapsed_ms=%s",
+                    thread_id,
+                    len(prepared.direct_answer),
+                    round((perf_counter() - request_started_at) * 1000, 1),
+                )
                 yield {
                     "event": "answer_delta",
                     "data": _json_event({"delta": prepared.direct_answer}),
                 }
             else:
-                stream_iter = await loop.run_in_executor(None, lambda: list(agent.stream_answer(prepared)))
-                for delta in stream_iter:
+                sentinel = object()
+                chunk_queue: queue.Queue[Any] = queue.Queue()
+                first_delta_sent = False
+                stream_started_at = perf_counter()
+
+                def produce_stream() -> None:
+                    try:
+                        for delta in agent.stream_answer(prepared):
+                            chunk_queue.put(delta)
+                    except Exception as exc:
+                        chunk_queue.put(exc)
+                    finally:
+                        chunk_queue.put(sentinel)
+
+                producer = threading.Thread(target=produce_stream, daemon=True)
+                producer.start()
+
+                while True:
+                    item = await loop.run_in_executor(None, chunk_queue.get)
+                    if item is sentinel:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    delta = str(item)
                     answer_chunks.append(delta)
+                    if not first_delta_sent:
+                        first_delta_sent = True
+                        logger.info(
+                            "stream_chat_first_delta thread_id=%s elapsed_ms=%s",
+                            thread_id,
+                            round((perf_counter() - request_started_at) * 1000, 1),
+                        )
                     yield {
                         "event": "answer_delta",
                         "data": _json_event({"delta": delta}),
                     }
+                logger.info(
+                    "stream_chat_stream_complete thread_id=%s elapsed_ms=%s chars=%s",
+                    thread_id,
+                    round((perf_counter() - stream_started_at) * 1000, 1),
+                    sum(len(chunk) for chunk in answer_chunks),
+                )
 
             final_answer = "".join(answer_chunks)
             final_answer = agent._append_recovery_note(final_answer, prepared.recovery)
+            final_answer = agent._inline_citation_labels(final_answer, prepared.citations)
+            final_answer = agent._normalize_inline_citation_format(final_answer)
+            final_answer = agent._strip_heading_trailing_citations(final_answer)
+            final_answer = agent._rewrite_inference_citation_style(final_answer)
+            prepared.citations = agent._filter_citations_by_answer_usage(final_answer, prepared.citations)
+            citation_note = agent._build_citation_note(prepared.citations)
+            if citation_note:
+                final_answer = f"{final_answer}\n\n{citation_note}"
+                yield {
+                    "event": "answer_delta",
+                    "data": _json_event({"delta": f"\n\n{citation_note}"}),
+                }
+
+            if title is None:
+                title = _resolve_title(thread_id, request, final_answer or request.query)
 
             prepared.trace.append(
                 AgentTraceStep(
@@ -381,10 +490,32 @@ def chat_stream(request: ChatRequest) -> EventSourceResponse:
                 ),
             }
             yield {"event": "done", "data": _json_event({"ok": True})}
+            logger.info(
+                "stream_chat_completed thread_id=%s total_elapsed_ms=%s answer_chars=%s",
+                thread_id,
+                round((perf_counter() - request_started_at) * 1000, 1),
+                len(final_answer),
+            )
         except Exception as exc:
-            import logging as _logging
-            _logging.getLogger(__name__).exception("Stream chat failed for thread %s", thread_id)
-            yield {"event": "error", "data": _json_event({"message": str(exc)})}
+            from services.llm import _llm_error_details
+
+            error_details = _llm_error_details(exc)
+            logger.exception(
+                "stream_chat_failed thread_id=%s elapsed_ms=%s",
+                thread_id,
+                round((perf_counter() - request_started_at) * 1000, 1),
+            )
+            yield {
+                "event": "error",
+                "data": _json_event(
+                    {
+                        "message": error_details["detail"],
+                        "category": error_details["category"],
+                        "error_type": error_details["error_type"],
+                        "status_code": error_details["status_code"],
+                    }
+                ),
+            }
             yield {"event": "done", "data": _json_event({"ok": False})}
 
     return EventSourceResponse(event_generator())

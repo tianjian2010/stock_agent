@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 
 from agents.stock_agent.runtime import AgentTask, AgentTraceStep, ToolResult
 from services.document_retriever import RetrievalResult, get_document_retriever
+from services.market_state_checker import get_market_state_checker
 from skills.mx_data import get_mx_data_skill, get_mx_search_skill, get_mx_select_skill
 
 
@@ -360,6 +361,90 @@ class StockScreenerSubAgent(BaseSubAgent):
         )
 
 
+class MarketStateSubAgent(BaseSubAgent):
+    """Agent that checks breakout, trend, and technical state."""
+
+    worker_name = "market_state_checker"
+
+    _HISTORICAL_HIGH_TERMS = ("历史新高", "历史最高", "史上最高", "历史高位", "上市以来最高")
+
+    def __init__(self) -> None:
+        self.checker = get_market_state_checker()
+
+    def run(self, payload: SubAgentInput) -> SubAgentOutput:
+        task = payload.task
+        query = task.query
+        dependency_notes = payload.dependency_notes
+        check_type = str(task.metadata.get("check_type", "")) if task.metadata else ""
+
+        try:
+            stock_code = self._extract_stock_code(query)
+            if not stock_code:
+                stock_code = query.strip()
+
+            is_historical = any(term in query for term in self._HISTORICAL_HIGH_TERMS)
+
+            if "trend" in check_type or "趋势" in query or "走势" in query:
+                trend = self.checker.check_trend(stock_code)
+                formatted = self.checker.format_trend_result(trend)
+            else:
+                breakout = self.checker.check_breakout(stock_code, extended=is_historical)
+                formatted = self.checker.format_breakout_result(breakout)
+
+            tool_result = ToolResult(
+                name=task.name,
+                request=query,
+                content=formatted,
+                reason=task.reason,
+                success=True,
+                worker=self.worker_name,
+            )
+            trace = [
+                AgentTraceStep(
+                    name=f"subagent:{self.worker_name}",
+                    status="completed",
+                    detail=f"Market state checked: {stock_code}",
+                    data={
+                        "task_id": task.task_id,
+                        "worker": self.worker_name,
+                        "check_type": check_type,
+                    },
+                )
+            ]
+            return SubAgentOutput(
+                task=task,
+                worker=self.worker_name,
+                tool_result=tool_result,
+                trace=trace,
+                summary_note=f"Market state analysis for {stock_code}.",
+            )
+        except Exception as exc:
+            return self._build_failure_output(
+                payload,
+                detail="Market state check failed.",
+                error_message=str(exc),
+                recovery_hint="Continue with document evidence or retry market lookup.",
+                tool_result=ToolResult(
+                    name=task.name,
+                    request=query,
+                    content=f"Market state check failed: {exc}",
+                    reason=task.reason,
+                    success=False,
+                    worker=self.worker_name,
+                    degraded=True,
+                    error_message=str(exc),
+                ),
+            )
+
+    @staticmethod
+    def _extract_stock_code(query: str) -> str:
+        import re
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", query)
+        if m:
+            return m.group(1)
+        return ""
+
+
 class SubAgentRegistry:
     def __init__(self) -> None:
         self._agents: dict[str, BaseSubAgent] = {
@@ -367,6 +452,7 @@ class SubAgentRegistry:
             "market_analyst": MarketDataSubAgent(),
             "news_analyst": NewsAnalysisSubAgent(),
             "stock_screener": StockScreenerSubAgent(),
+            "market_state_checker": MarketStateSubAgent(),
         }
 
     def get(self, worker: str) -> BaseSubAgent:

@@ -135,3 +135,31 @@ a {
   border: 0;
   padding: 0;
 }
+
+.prose .markdown-table-wrap {
+  margin: 0.9rem 0;
+  overflow-x: auto;
+}
+
+.prose .markdown-table {
+  width: 100%;
+  min-width: 26rem;
+  border-collapse: collapse;
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  overflow: hidden;
+  background: rgba(255, 253, 248, 0.82);
+}
+
+.prose .markdown-table th,
+.prose .markdown-table td {
+  padding: 0.7rem 0.85rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.prose .markdown-table th {
+  background: rgba(124, 92, 58, 0.08);
+  font-weight: 600;
+}

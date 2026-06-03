@@ -6,7 +6,7 @@ from typing import Any
 
 import requests
 
-from app.config import MX_API_KEY, MX_DATA_URL, MX_SEARCH_URL, MX_SELECT_URL
+from app.config import MX_API_KEY, MX_DATA_KLINE_URL, MX_DATA_URL, MX_SEARCH_URL, MX_SELECT_URL
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,22 @@ class MXDataSkill(_BaseMXSkill):
     def query(self, query_str: str) -> dict[str, Any]:
         return self._post(MX_DATA_URL, {"toolQuery": query_str})
 
+    def query_kline(
+        self,
+        stock_code: str,
+        *,
+        period: str = "day",
+        count: int = 120,
+        adjust: str = "qfq",
+    ) -> dict[str, Any]:
+        payload = {
+            "stockCode": stock_code,
+            "period": period,
+            "count": count,
+            "adjust": adjust,
+        }
+        return self._post(MX_DATA_KLINE_URL, payload)
+
     def format_result(self, data: dict[str, Any]) -> str:
         if error := data.get("error"):
             return f"行情查询失败: {error}"
@@ -83,7 +99,19 @@ class MXDataSkill(_BaseMXSkill):
                     change_display = f"{float(change):+.2f}%"
                 except (TypeError, ValueError):
                     change_display = str(change)
-                lines.append(f"- {code} {name}: {price} ({change_display})")
+                # Extract additional technical fields when available
+                parts = [f"- {code} {name}: {price} ({change_display})"]
+                day_high = row.get("f15", "")
+                day_low = row.get("f16", "")
+                if day_high and day_low:
+                    parts.append(f" 高{day_high}/低{day_low}")
+                open_price = row.get("f17", "")
+                prev_close = row.get("f18", "")
+                if open_price:
+                    parts.append(f" 开{open_price}")
+                if prev_close:
+                    parts.append(f" 昨收{prev_close}")
+                lines.append("".join(parts))
             return "\n".join(lines)
 
         return json.dumps(data, ensure_ascii=False, indent=2)

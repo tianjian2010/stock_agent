@@ -29,6 +29,8 @@ from agents.stock_agent.runtime import (
     summarize_plan,
 )
 from agents.stock_agent.subagents import SubAgentInput, SubAgentOutput, SubAgentRegistry
+from agents.stock_agent.time_router import IntentType, classify_intent
+from services.doc_fact_index import get_doc_fact_index
 from app.config import ENABLE_LLM_PLANNER, PLAN_REUSE_MAX_AGE_HOURS, PLAN_REUSE_MIN_SCORE
 from services.db import get_chat_db
 from services.document_retriever import (
@@ -52,8 +54,34 @@ SYSTEM_PROMPT = """
 回答要求：
 - 默认使用中文。
 - 优先引用本地资料，引用格式使用 [资料1]、[资料2]。
-- 如果使用了外部行情或资讯，要明确标注为“实时数据/资讯”。
+- 如果使用了外部行情或资讯，要明确标注为"实时数据/资讯"。
 - 如果证据不足，直接说明不确定点，不要编造。
+
+时间窗口统计输出规范：
+- 当回答"最近一周/今天提到最多的股票"类问题时，先给出统计排名，再逐个简述研报观点。
+- 排名数据来源于研报正文中股票代码的出现频率，请明确说明统计口径。
+- 每只股票的研报观点引用对应的 [资料N]，确保可追溯。
+
+行情研判输出规范：
+- 当回答"是否突破新高/趋势方向"类问题时，必须严格按以下三段式结构输出：
+
+  【实时数据/资讯】
+  - 现价：XX  涨跌幅：+XX%  今日高/低：XX/XX
+  - 周期最高价：XX（近N日）  距高点：XX%  突破研判：是否在突破阈值（2%）内
+  - 如果是趋势问题，列出关键均线值（MA5/MA10/MA20/MA60）及趋势方向与强度
+  - 上述所有行情数据必须标注为"实时数据/资讯"，不可省略任何字段
+
+  【文档观点】
+  - 逐条引用 [资料N] 中的原文判断，注明出处
+  - 区分文档中描述的突破类型（如"突破半年线"vs"突破历史新高"），不可混淆
+
+  【综合判断】
+  - 结合实时数据与文档观点，给出明确的突破/趋势结论
+  - 若实时数据与文档观点矛盾，先说明冲突点，再给出判断
+  - 若数据不足以判断"历史新高"（如周期仅覆盖1年），须明确说明覆盖范围和局限
+
+- 趋势判断如果基于技术指标，必须说明依据的指标名称和计算周期。
+- 禁止将"突破半年线"等中期技术位与"突破历史新高"混为一谈。
 """.strip()
 
 PLANNER_PROMPT = """
@@ -76,6 +104,11 @@ PLANNER_PROMPT = """
 4. 如果问题需要先看本地研报再查实时信息，请先放 retrieval 阶段
 5. 如果只是纯新闻或纯选股，可直接给 tool 阶段
 6. metadata 可以为空对象，若是工具阶段可放 tool_name
+
+强约束（必须遵守）：
+- 当用户问题包含"最近一周/最近N天/本月/今天/昨天"等时间窗口词，且询问"提到/有哪些/什么股票/最多/排名"时，不得仅使用 retrieval 阶段，必须确保调用结构化统计工具。
+- 当用户问题包含"突破/新高/新低/走势/趋势/均线/涨势/跌势"等行情判断词时，必须添加 market_analyst 工具阶段查询实时行情。
+- 当用户问题包含股票代码（6位数字）或股票名称时，考虑同时检索本地研报和实时行情。
 """.strip()
 
 FILENAME_PATTERN = re.compile(
@@ -128,6 +161,8 @@ class StockAgent:
         self.chat_store = get_chat_db()
         self.memory_service = ConversationMemoryService(self.chat_store)
         self.subagent_registry = SubAgentRegistry()
+        self._stock_code_pattern = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+        self._symbol_reference_terms = ("上面", "这些", "前面", "刚才", "上述")
 
     def generate_title(self, user_message: str) -> str:
         fallback = user_message.strip().replace("\n", " ")[:15] or "新对话"
@@ -145,6 +180,7 @@ class StockAgent:
         active_thread_id = thread_id or ""
         base_plan = build_agent_plan(query)
         plan, planner_trace = self._select_plan(query, base_plan, thread_id=active_thread_id)
+        memory_recent_messages: list[dict[str, Any]] = []
         trace: list[AgentTraceStep] = [
             AgentTraceStep(
                 name="plan_query",
@@ -175,6 +211,7 @@ class StockAgent:
             memory = self.memory_service.load_memory(active_thread_id)
             memory_messages = self.memory_service.build_context_messages(active_thread_id, query)
             memory_status = self.memory_service.get_memory_status(active_thread_id)
+            memory_recent_messages = memory.recent_messages
             prior_message_count = max(0, len(memory_messages) - 1 - (1 if memory.summary else 0))
             trace.append(
                 AgentTraceStep(
@@ -185,6 +222,17 @@ class StockAgent:
                         f"{'an existing summary' if memory.summary else 'no summary'}."
                     ),
                     data=memory_status,
+                )
+            )
+
+        resolved_codes = self._enrich_symbol_lookup_plan_from_memory(query, plan, memory_recent_messages)
+        if resolved_codes:
+            trace.append(
+                AgentTraceStep(
+                    name="symbol_lookup_context",
+                    status="completed",
+                    detail="Resolved referenced stock codes from recent conversation context.",
+                    data={"resolved_codes": resolved_codes},
                 )
             )
 
@@ -360,10 +408,12 @@ class StockAgent:
 
         memory_messages: list[dict[str, str]] = []
         memory_status: dict[str, Any] = {}
+        memory_recent_messages: list[dict[str, Any]] = []
         if active_thread_id:
             memory = self.memory_service.load_memory(active_thread_id)
             memory_messages = self.memory_service.build_context_messages(active_thread_id, query)
             memory_status = self.memory_service.get_memory_status(active_thread_id)
+            memory_recent_messages = memory.recent_messages
             if progress_callback is not None:
                 progress_callback(
                     "memory_loaded",
@@ -382,6 +432,17 @@ class StockAgent:
                         f"{'an existing summary' if memory.summary else 'no summary'}."
                     ),
                     data=memory_status,
+                )
+            )
+
+        resolved_codes = self._enrich_symbol_lookup_plan_from_memory(query, plan, memory_recent_messages)
+        if resolved_codes:
+            trace.append(
+                AgentTraceStep(
+                    name="symbol_lookup_context",
+                    status="completed",
+                    detail="Resolved referenced stock codes from recent conversation context.",
+                    data={"resolved_codes": resolved_codes},
                 )
             )
 
@@ -483,6 +544,18 @@ class StockAgent:
             direct_answer=None,
         )
 
+    @staticmethod
+    def _detect_market_state_format_hint(tool_context: str) -> str:
+        """Return a formatting directive when tool_context contains market state data."""
+        if "mx_market_state" not in tool_context and "突破分析" not in tool_context and "趋势分析" not in tool_context:
+            return ""
+        return (
+            "【格式要求】此问题涉及行情研判，必须严格按以下三段式结构输出，不可省略任何数据字段：\n"
+            "1. 【实时数据/资讯】现价、涨跌幅、今日高/低、周期最高价、距高点百分比、突破研判（是否在2%阈值内）\n"
+            "2. 【文档观点】引用[资料N]原文，区分突破类型（如突破半年线≠突破历史新高）\n"
+            "3. 【综合判断】结合实时与文档的最终结论\n"
+        )
+
     def _build_answer_messages(
         self,
         query: str,
@@ -492,13 +565,16 @@ class StockAgent:
         recovery_context: str = "",
         memory_messages: list[dict[str, str]] | None = None,
     ) -> list[dict[str, str]]:
+        format_hint = self._detect_market_state_format_hint(tool_context)
         prompt_parts = [
             f"用户问题：{query}",
             doc_context,
             tool_context,
             recovery_context,
-            "请基于以上证据回答。若证据冲突，先说明冲突点，再给出判断。",
         ]
+        if format_hint:
+            prompt_parts.append(format_hint)
+        prompt_parts.append("请基于以上证据回答。若证据冲突，先说明冲突点，再给出判断。")
         messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if memory_messages:
             messages.extend(memory_messages[:-1])
@@ -756,7 +832,62 @@ class StockAgent:
                 raise ValueError("Planner output must be a JSON list.")
             return parsed
 
+    def _enrich_symbol_lookup_plan_from_memory(
+        self,
+        query: str,
+        plan: AgentPlan,
+        recent_messages: list[dict[str, Any]],
+    ) -> list[str]:
+        if plan.intent != "market_symbol_lookup":
+            return []
+        if self._stock_code_pattern.search(query):
+            return []
+        if not any(term in query for term in self._symbol_reference_terms):
+            return []
+        if not plan.planned_tools:
+            return []
+
+        resolved_codes = self._extract_recent_stock_codes(recent_messages)
+        if not resolved_codes:
+            return []
+
+        codes_text = " ".join(resolved_codes)
+        for planned_tool in plan.planned_tools:
+            if planned_tool.name != "mx_search":
+                continue
+            planned_tool.query = (
+                f"{query}\n\n参考代码: {codes_text}\n"
+                "请按代码顺序返回每个代码对应的股票名称。"
+            )
+            planned_tool.reason = "用户使用了上下文指代代码，已从最近对话补全代码后执行映射。"
+        if plan.notes is not None:
+            plan.notes.append("代码映射问题已从最近对话补全缺失代码。")
+        return resolved_codes
+
+    def _extract_recent_stock_codes(self, recent_messages: list[dict[str, Any]]) -> list[str]:
+        for message in reversed(recent_messages):
+            content = str(message.get("content") or "")
+            if not content:
+                continue
+            codes = self._extract_stock_codes(content)
+            if codes:
+                return codes
+        return []
+
+    def _extract_stock_codes(self, text: str) -> list[str]:
+        codes: list[str] = []
+        for code in self._stock_code_pattern.findall(text or ""):
+            if code not in codes:
+                codes.append(code)
+        return codes
+
     def _handle_catalog_query(self, query: str, plan: AgentPlan) -> str | None:
+        if plan.direct_answer_mode == "window_stats":
+            return self._answer_window_stats(query)
+
+        if plan.direct_answer_mode == "daily_digest":
+            return self._answer_daily_digest(query)
+
         if plan.direct_answer_mode == "documents_by_date":
             published_at = parse_query_date(query)
             if not published_at:
@@ -795,7 +926,7 @@ class StockAgent:
                 docs = self.retriever.list_documents()
             if not docs:
                 target = matched_keyword or query
-                return f"未找到与“{target}”相关的本地投研资料。"
+                return f"未找到与"{target}"相关的本地投研资料。"
             lines = [f"本地投研资料清单（共 {len(docs)} 篇）："]
             for item in docs[:30]:
                 lines.append(f"- {item['filename']} ({item.get('published_at') or '未知日期'})")
@@ -814,6 +945,210 @@ class StockAgent:
                 content = document["content"][:1200]
                 return f"文档：{metadata['filename']} ({metadata.get('published_at') or '未知日期'})\n\n{content}"
 
+        return None
+
+    def _answer_window_stats(self, query: str) -> str | None:
+        intent = classify_intent(query)
+        date_from = intent.date_from
+        date_to = intent.date_to
+        top_n = intent.top_n
+
+        fact_index = get_doc_fact_index()
+        docs_in_range = self.retriever.find_documents_in_range(date_from, date_to)
+        if not docs_in_range:
+            return f"{date_from} 至 {date_to} 期间没有本地投研资料."
+
+        top_stocks = fact_index.get_top_stocks(date_from, date_to, top_n=top_n)
+
+        if not top_stocks:
+            return (
+                f"{date_from} 至 {date_to} 期间共有 {len(docs_in_range)} 篇研报, "
+                f"但未从中检测到明确的股票代码提及."
+            )
+
+        lines = [
+            f"{date_from} 至 {date_to} 期间 (共 {len(docs_in_range)} 篇研报), "
+            f"提到最多的 {len(top_stocks)} 只股票:",
+            "",
+        ]
+        for rank, stock in enumerate(top_stocks, start=1):
+            name_part = f" {stock.stock_name}" if stock.stock_name else ""
+            lines.append(
+                f"{rank}. {stock.stock_code}{name_part} - "
+                f"提及 {stock.total_mentions} 次, 涉及 {stock.doc_count} 篇研报, "
+                f"横跨 {stock.days_with_mentions} 天"
+            )
+
+        lines.append("")
+        lines.append(
+            "统计方式: 基于研报正文中 6 位股票代码的出现频率."
+            "如需了解某只股票的具体研报内容, 可直接询问."
+        )
+        return "\n".join(lines)
+
+    def _answer_daily_digest(self, query: str) -> str | None:
+        intent = classify_intent(query)
+        target_date = intent.date_from
+
+        docs_on_date = self.retriever.list_documents_by_date(target_date)
+        if not docs_on_date:
+            return f"{target_date} 没有本地投研资料."
+
+        fact_index = get_doc_fact_index()
+        summary = fact_index.get_daily_summary(target_date)
+        if summary is None:
+            return f"{target_date} 暂无可用的日度统计摘要。"
+
+        lines = [f"{target_date} 投研资料概要 (共 {summary.total_docs_on_date} 篇):", ""]
+
+        if summary.stocks:
+            # Separate stocks by mention_type
+            stock_items = [s for s in summary.stocks if s.get("mention_type") == "stock"]
+            etf_items = [s for s in summary.stocks if s.get("mention_type") == "etf"]
+            concept_items = [s for s in summary.stocks if s.get("mention_type") == "concept"]
+
+            if stock_items:
+                lines.append("研报中涉及的股票 (按提及频次排序):")
+                for rank, stock in enumerate(stock_items, start=1):
+                    name = stock.get("stock_name") or "未知"
+                    code_part = f"{stock['stock_code']} " if stock.get("stock_code") else ""
+                    lines.append(
+                        f"  {rank}. {code_part}{name} - "
+                        f"提及 {stock['mentions']} 次, 出现在 {stock['doc_count']} 篇研报中"
+                    )
+            if etf_items:
+                lines.append("")
+                lines.append("研报中涉及的ETF/基金 (按提及频次排序):")
+                for rank, stock in enumerate(etf_items, start=1):
+                    name = stock.get("stock_name") or "未知"
+                    code_part = f"{stock['stock_code']} " if stock.get("stock_code") else ""
+                    lines.append(
+                        f"  {rank}. {code_part}{name} - "
+                        f"提及 {stock['mentions']} 次, 出现在 {stock['doc_count']} 篇研报中"
+                    )
+            if concept_items:
+                lines.append("")
+                lines.append("研报中涉及的概念/板块 (按提及频次排序):")
+                for rank, stock in enumerate(concept_items, start=1):
+                    name = stock.get("stock_name") or "未知"
+                    code_part = f"{stock['stock_code']} " if stock.get("stock_code") else ""
+                    lines.append(
+                        f"  {rank}. {code_part}{name} - "
+                        f"提及 {stock['mentions']} 次, 出现在 {stock['doc_count']} 篇研报中"
+                    )
+        else:
+            lines.append("当日研报未检测到明确的股票代码提及.")
+
+        lines.append("")
+        lines.append("当日研报清单:")
+        for item in docs_on_date:
+            lines.append(f"  - {item['filename']}")
+
+        if summary.stocks:
+            lines.append("")
+            lines.append("如需了解某只股票在研报中的具体内容, 可以进一步询问.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_match_text(value: str) -> str:
+        return re.sub(r"[^0-9A-Za-z一-鿿]+", "", value).lower()
+
+    def _focus_doc_results(self, query: str, doc_results: list[RetrievalResult]) -> list[RetrievalResult]:
+        if len(doc_results) <= 1:
+            if not doc_results:
+                return doc_results
+            target_topic = self._resolve_target_document_topic(query, doc_results)
+            if not target_topic and doc_results:
+                first_topic = self._normalize_match_text(str(doc_results[0].metadata.get("topic") or ""))
+                target_topic = first_topic or None
+            if not target_topic:
+                return doc_results
+            return self._maybe_include_latest_topic_document(query, target_topic, doc_results)
+
+        target_filename = self._resolve_target_document_filename(query, doc_results)
+        if not target_filename:
+            target_topic = self._resolve_target_document_topic(query, doc_results)
+            if not target_topic:
+                return doc_results
+            focused = [
+                item
+                for item in doc_results
+                if self._normalize_match_text(str(item.metadata.get("topic") or "")) == target_topic
+            ]
+            if not focused:
+                return doc_results
+            return self._maybe_include_latest_topic_document(query, target_topic, focused)
+
+        focused = [item for item in doc_results if item.metadata.get("filename") == target_filename]
+        return focused or doc_results
+
+    @staticmethod
+    def _is_recency_query(query: str) -> bool:
+        return any(term in query for term in ("近期", "最近", "最新", "这几天", "近几次", "近几篇", "近几份"))
+
+    def _maybe_include_latest_topic_document(
+        self,
+        query: str,
+        target_topic: str,
+        focused: list[RetrievalResult],
+    ) -> list[RetrievalResult]:
+        if not self._is_recency_query(query):
+            return focused
+        if any(term in query for term in ("综合看", "总结", "归纳", "梳理", "共同点", "对比")):
+            return focused
+
+        current_filenames = {str(item.metadata.get("filename") or "") for item in focused}
+        docs = self.retriever.list_documents()
+        same_topic_docs = [
+            item
+            for item in docs
+            if self._normalize_match_text(str(item.get("topic") or "")) == target_topic
+        ]
+        if not same_topic_docs:
+            return focused
+
+        latest_doc = max(
+            same_topic_docs,
+            key=lambda d: (d.get("published_at") or "", d.get("filename") or ""),
+        )
+        latest_filename = latest_doc.get("filename")
+        if not latest_filename or latest_filename in current_filenames:
+            return focused
+
+        try:
+            latest_doc = self.retriever.get_document(latest_filename)
+        except Exception:
+            return focused
+        if not latest_doc or not latest_doc.get("content"):
+            return focused
+
+        latest_result = RetrievalResult(
+            content=latest_doc["content"][:700],
+            score=0.0,
+            metadata={
+                **latest_doc.get("metadata", {}),
+                "topic": target_topic,
+                "filename": latest_filename,
+            },
+        )
+        return [latest_result] + focused
+
+    def _resolve_target_document_topic(
+        self, query: str, doc_results: list[RetrievalResult]
+    ) -> str | None:
+        for item in doc_results:
+            topic = str(item.metadata.get("topic") or "")
+            if topic and self._normalize_match_text(topic) in self._normalize_match_text(query):
+                return self._normalize_match_text(topic)
+        return None
+
+    def _resolve_target_document_filename(
+        self, query: str, doc_results: list[RetrievalResult]
+    ) -> str | None:
+        for item in doc_results:
+            filename = str(item.metadata.get("filename") or "")
+            if filename and filename in query:
+                return filename
         return None
 
     def _dispatch_task_graph(
@@ -844,7 +1179,14 @@ class StockAgent:
             for output in batch_result["outputs"]:
                 completed_outputs[output.task.task_id] = output
                 if output.doc_results:
-                    doc_results = output.doc_results
+                    seen_uids = {item.metadata.get("chunk_uid", "") for item in doc_results}
+                    for item in output.doc_results:
+                        uid = item.metadata.get("chunk_uid", "")
+                        if uid and uid not in seen_uids:
+                            seen_uids.add(uid)
+                            doc_results.append(item)
+                        elif not uid:
+                            doc_results.append(item)
                 if output.tool_result is not None:
                     tool_results.append(output.tool_result)
             if progress_callback is not None:
@@ -1049,14 +1391,17 @@ class StockAgent:
         recovery_context: str = "",
         memory_messages: list[dict[str, str]] | None = None,
     ) -> str:
-        chat = create_stock_chat(temperature=0.3, max_tokens=2048, thinking_enabled=False)
+        format_hint = self._detect_market_state_format_hint(tool_context)
         prompt_parts = [
             f"用户问题：{query}",
             doc_context,
             tool_context,
             recovery_context,
-            "请基于以上证据回答。若证据冲突，先说明冲突点，再给出判断。",
         ]
+        if format_hint:
+            prompt_parts.append(format_hint)
+        prompt_parts.append("请基于以上证据回答。若证据冲突，先说明冲突点，再给出判断。")
+        chat = create_stock_chat(temperature=0.3, max_tokens=2048, thinking_enabled=False)
         messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if memory_messages:
             messages.extend(memory_messages[:-1])
@@ -1196,6 +1541,63 @@ class StockAgent:
         return summary
 
     @staticmethod
+    def _inline_citation_labels(answer: str, _citations: list[dict[str, Any]]) -> str:
+        """Keep answer text unchanged; citation list is handled separately."""
+        return answer
+
+    @staticmethod
+    def _normalize_inline_citation_format(answer: str) -> str:
+        """Normalize common citation bracket variants to [资料N]."""
+        normalized = answer.replace("【资料", "[资料").replace("】", "]")
+        return re.sub(r"\[资料\s*(\d+)\s*\]", r"[资料\1]", normalized)
+
+    @staticmethod
+    def _strip_heading_trailing_citations(answer: str) -> str:
+        """Remove citations that appear at the end of markdown headings."""
+        cleaned_lines: list[str] = []
+        for line in answer.splitlines():
+            if line.lstrip().startswith("#"):
+                line = re.sub(r"\s*(?:\[资料\d+\])+\s*$", "", line)
+            cleaned_lines.append(line)
+        return "\n".join(cleaned_lines)
+
+    @staticmethod
+    def _rewrite_inference_citation_style(answer: str) -> str:
+        """No-op placeholder for future style rules."""
+        return answer
+
+    @staticmethod
+    def _filter_citations_by_answer_usage(
+        answer: str,
+        citations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Keep only cited items; if no inline labels, keep original list."""
+        used_ids = {int(match.group(1)) for match in re.finditer(r"\[资料(\d+)\]", answer)}
+        if not used_ids:
+            return citations
+        filtered: list[dict[str, Any]] = []
+        for idx, item in enumerate(citations, start=1):
+            if idx in used_ids:
+                filtered.append(item)
+        return filtered
+
+    @staticmethod
+    def _build_citation_note(citations: list[dict[str, Any]]) -> str:
+        if not citations:
+            return ""
+        lines = ["参考资料："]
+        for index, item in enumerate(citations, start=1):
+            filename = str(item.get("filename") or item.get("source") or "")
+            published_at = str(item.get("published_at") or "")
+            if filename and published_at:
+                lines.append(f"[资料{index}] {filename} ({published_at})")
+            elif filename:
+                lines.append(f"[资料{index}] {filename}")
+            else:
+                lines.append(f"[资料{index}]")
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_tool_context(tool_results: list[ToolResult]) -> str:
         if not tool_results:
             return ""
@@ -1217,7 +1619,7 @@ class StockAgent:
         error: Exception,
     ) -> str:
         lines = [
-            f"已检索到与“{query}”相关的材料，但当前无法调用大模型生成最终总结。",
+            f"已检索到与"{query}"相关的材料，但当前无法调用大模型生成最终总结。",
             f"原因：{error}",
         ]
         if doc_context:
